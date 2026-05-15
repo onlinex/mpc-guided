@@ -9,7 +9,7 @@ from r3m import load_r3m
 
 
 R3M_INPUT_SIZE = 224
-R3M_MODEL_ID = "resnet34"
+R3M_MODEL_ID = "resnet18"
 R3M_FEAT_DIM = 512
 R3M_MODEL_IDS = ("resnet18", "resnet34")
 

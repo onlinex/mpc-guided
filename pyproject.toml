@@ -9,6 +9,7 @@ dependencies = [
     "mani-skill>=3.0.1",
     "numpy>=1.26.0",
     "r3m",
+    "setuptools<81",
     "tensorboard>=2.20.0",
     "torch==2.10.0",
     "torchvision==0.25.0",

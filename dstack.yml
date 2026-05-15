@@ -23,13 +23,12 @@ max_duration: 2h
 commands:
   - pip install -q uv
   - uv sync --frozen
-  # Replace this smoke rollout with the TD-MPC2 trainer once it exists.
   - >
-    uv run python demo.py
-    --render-mode none
-    --render-backend none
+    uv run python train_dynamics.py
+    --render-backend gpu
     --sim-backend physx_cuda
-    --obs-mode state
-    --policy random
-    --episodes 2
-    --max-steps 50
+    --initial-episodes 2
+    --collection-rounds 1
+    --episodes-per-round 1
+    --max-steps 25
+    --train-steps-per-round 25

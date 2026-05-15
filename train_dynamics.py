@@ -1,0 +1,662 @@
+"""Train a visual forward dynamics model from actor-sampled ManiSkill interaction."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+import re
+from typing import Any
+
+import gymnasium as gym
+import mani_skill.envs  # noqa: F401
+import numpy as np
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from src.actor import (
+    StochasticActor,
+    StochasticActorConfig,
+    VideoActorTrainer,
+    VideoActorTrainerConfig,
+)
+from src.backbone import R3M_FEAT_DIM, R3M_MODEL_IDS, build_backbone, encode_images
+from src.datasets.video_pairs import VideoFramePairSampler
+from src.dynamics import (
+    DynamicsTrainer,
+    DynamicsTrainerConfig,
+    ForwardDynamicsConfig,
+    ForwardDynamicsModel,
+    TransitionReplayBuffer,
+)
+from src.utils import pick_device, to_scalar_bool
+
+
+ENV_ID = "PickCube-v1"
+
+
+@dataclass(frozen=True)
+class TrainDynamicsConfig:
+    env_id: str = ENV_ID
+    obs_mode: str = "rgb"
+    control_mode: str = "pd_joint_delta_pos"
+    sim_backend: str = "physx_cpu"
+    render_backend: str = "gpu"
+    camera_uid: str | None = None
+    camera_width: int = 224
+    camera_height: int = 224
+    r3m_model_id: str = "resnet18"
+    seed: int = 0
+    initial_episodes: int = 16
+    collection_rounds: int = 10
+    episodes_per_round: int = 8
+    max_steps: int = 100
+    buffer_capacity: int = 50_000
+    train_steps_per_round: int = 1000
+    batch_size: int = 256
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    grad_clip_norm: float | None = 10.0
+    hidden_dims: tuple[int, ...] = (512, 512)
+    log_dir: str = "runs/dynamics"
+    run_name: str | None = None
+    log_interval: int = 50
+    checkpoint_interval: int = 1000
+    actor_video_training: bool = True
+    actor_video_dataset_dir: str = "data/pickcube_expert_videos"
+    actor_train_interval: int = 250
+    actor_train_steps: int = 10
+    actor_batch_size: int = 32
+    actor_rollout_horizon: int = 1
+    actor_pair_min_gap: int = 1
+    actor_pair_max_gap: int = 1
+    actor_video_cache_size: int = 8
+    actor_lr: float = 3e-4
+    actor_weight_decay: float = 1e-4
+    actor_grad_clip_norm: float | None = 10.0
+    device: str = "auto"
+
+
+def parse_args() -> TrainDynamicsConfig:
+    defaults = TrainDynamicsConfig()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--env-id", default=defaults.env_id)
+    p.add_argument("--control-mode", default=defaults.control_mode)
+    p.add_argument("--sim-backend", default=defaults.sim_backend)
+    p.add_argument("--render-backend", default=defaults.render_backend)
+    p.add_argument("--camera-uid", default=defaults.camera_uid)
+    p.add_argument("--camera-width", type=int, default=defaults.camera_width)
+    p.add_argument("--camera-height", type=int, default=defaults.camera_height)
+    p.add_argument("--r3m-model-id", choices=R3M_MODEL_IDS, default=defaults.r3m_model_id)
+    p.add_argument("--seed", type=int, default=defaults.seed)
+    p.add_argument("--initial-episodes", type=int, default=defaults.initial_episodes)
+    p.add_argument("--collection-rounds", type=int, default=defaults.collection_rounds)
+    p.add_argument("--episodes-per-round", type=int, default=defaults.episodes_per_round)
+    p.add_argument("--max-steps", type=int, default=defaults.max_steps)
+    p.add_argument("--buffer-capacity", type=int, default=defaults.buffer_capacity)
+    p.add_argument("--train-steps-per-round", type=int, default=defaults.train_steps_per_round)
+    p.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    p.add_argument("--lr", type=float, default=defaults.lr)
+    p.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
+    p.add_argument("--grad-clip-norm", type=float, default=defaults.grad_clip_norm)
+    p.add_argument("--hidden-dims", default=",".join(str(x) for x in defaults.hidden_dims))
+    p.add_argument("--log-dir", default=defaults.log_dir)
+    p.add_argument("--run-name", default=defaults.run_name)
+    p.add_argument("--log-interval", type=int, default=defaults.log_interval)
+    p.add_argument("--checkpoint-interval", type=int, default=defaults.checkpoint_interval)
+    p.add_argument(
+        "--actor-video-training",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.actor_video_training,
+    )
+    p.add_argument("--actor-video-dataset-dir", default=defaults.actor_video_dataset_dir)
+    p.add_argument("--actor-train-interval", type=int, default=defaults.actor_train_interval)
+    p.add_argument("--actor-train-steps", type=int, default=defaults.actor_train_steps)
+    p.add_argument("--actor-batch-size", type=int, default=defaults.actor_batch_size)
+    p.add_argument("--actor-rollout-horizon", type=int, default=defaults.actor_rollout_horizon)
+    p.add_argument("--actor-pair-min-gap", type=int, default=defaults.actor_pair_min_gap)
+    p.add_argument("--actor-pair-max-gap", type=int, default=defaults.actor_pair_max_gap)
+    p.add_argument("--actor-video-cache-size", type=int, default=defaults.actor_video_cache_size)
+    p.add_argument("--actor-lr", type=float, default=defaults.actor_lr)
+    p.add_argument("--actor-weight-decay", type=float, default=defaults.actor_weight_decay)
+    p.add_argument("--actor-grad-clip-norm", type=float, default=defaults.actor_grad_clip_norm)
+    p.add_argument("--device", default=defaults.device)
+    args = p.parse_args()
+
+    hidden_dims = tuple(int(x) for x in args.hidden_dims.split(",") if x)
+    if not hidden_dims:
+        p.error("--hidden-dims must contain at least one layer size")
+    for field in (
+        "initial_episodes",
+        "collection_rounds",
+        "episodes_per_round",
+        "max_steps",
+        "buffer_capacity",
+        "train_steps_per_round",
+        "batch_size",
+        "log_interval",
+        "checkpoint_interval",
+        "actor_train_interval",
+        "actor_train_steps",
+        "actor_batch_size",
+        "actor_rollout_horizon",
+        "actor_pair_min_gap",
+        "actor_pair_max_gap",
+        "actor_video_cache_size",
+    ):
+        if getattr(args, field) < 1:
+            p.error(f"--{field.replace('_', '-')} must be >= 1")
+    if args.actor_pair_max_gap < args.actor_pair_min_gap:
+        p.error("--actor-pair-max-gap must be >= --actor-pair-min-gap")
+    return TrainDynamicsConfig(
+        **{
+            **vars(args),
+            "obs_mode": "rgb",
+            "hidden_dims": hidden_dims,
+        }
+    )
+
+
+def make_env(cfg: TrainDynamicsConfig) -> gym.Env:
+    camera_uid = cfg.camera_uid or "base_camera"
+    sensor_configs = {
+        camera_uid: {
+            "width": cfg.camera_width,
+            "height": cfg.camera_height,
+        }
+    }
+    kwargs = {
+        "obs_mode": cfg.obs_mode,
+        "control_mode": cfg.control_mode,
+        "sim_backend": cfg.sim_backend,
+        "render_backend": cfg.render_backend,
+        "sensor_configs": sensor_configs,
+    }
+    return gym.make(cfg.env_id, **kwargs)
+
+
+def select_device(name: str) -> torch.device:
+    if name == "auto":
+        return pick_device()
+    return torch.device(name)
+
+
+def create_run_dir(root: str, run_name: str | None) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dirname = timestamp
+    if run_name:
+        dirname = f"{timestamp}-{sanitize_run_name(run_name)}"
+    run_dir = Path(root) / dirname
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def sanitize_run_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", name.strip())
+    cleaned = cleaned.strip("-._")
+    if not cleaned or not re.search(r"[A-Za-z0-9]", cleaned):
+        raise ValueError("--run-name must contain at least one alphanumeric character")
+    return cleaned
+
+
+def collect_actor_episodes(
+    *,
+    env: gym.Env,
+    actor: StochasticActor,
+    buffer: TransitionReplayBuffer,
+    backbone: torch.nn.Module,
+    device: torch.device,
+    cfg: TrainDynamicsConfig,
+    writer: SummaryWriter,
+    global_episode: int,
+    global_step: int,
+    phase: str,
+) -> tuple[int, int]:
+    progress = tqdm(
+        range(cfg.episodes_per_round),
+        desc=f"collect/{phase}",
+        unit="episode",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for _ in progress:
+        obs, _ = env.reset(seed=cfg.seed + global_episode)
+        state = encode_observation(backbone, obs, device, cfg.camera_uid)
+        ep_return, succeeded = 0.0, False
+        action_abs_sum, actor_std_sum = 0.0, 0.0
+        for ep_step in range(cfg.max_steps):
+            action, actor_std = sample_actor_action(actor, state, device)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            next_state = encode_observation(backbone, next_obs, device, cfg.camera_uid)
+            buffer.add(state, action, next_state)
+
+            ep_return += float(np.asarray(reward).reshape(-1)[0])
+            action_abs_sum += float(np.abs(action).mean())
+            actor_std_sum += actor_std
+            succeeded = succeeded or to_scalar_bool(info.get("success", False))
+            state = next_state
+            global_step += 1
+
+            done = to_scalar_bool(terminated) or to_scalar_bool(truncated)
+            if done:
+                break
+
+        writer.add_scalar("rollout/episode_return", ep_return, global_episode)
+        writer.add_scalar("rollout/episode_success", float(succeeded), global_episode)
+        writer.add_scalar("rollout/episode_steps", ep_step + 1, global_episode)
+        writer.add_scalar(
+            "rollout/policy_action_abs_mean",
+            action_abs_sum / (ep_step + 1),
+            global_episode,
+        )
+        writer.add_scalar(
+            "rollout/policy_std_mean",
+            actor_std_sum / (ep_step + 1),
+            global_episode,
+        )
+        writer.add_scalar("replay_buffer/size", len(buffer), global_step)
+        progress.set_postfix(
+            episode=global_episode,
+            steps=ep_step + 1,
+            ret=f"{ep_return:.2f}",
+            success=int(succeeded),
+            buffer=len(buffer),
+            action=f"{action_abs_sum / (ep_step + 1):.2f}",
+            std=f"{actor_std_sum / (ep_step + 1):.2f}",
+        )
+        global_episode += 1
+    return global_episode, global_step
+
+
+def train_round(
+    *,
+    trainer: DynamicsTrainer,
+    actor: StochasticActor,
+    actor_video_trainer: VideoActorTrainer | None,
+    buffer: TransitionReplayBuffer,
+    cfg: TrainDynamicsConfig,
+    writer: SummaryWriter,
+    device: torch.device,
+    train_step: int,
+    actor_train_step: int,
+    round_idx: int,
+    run_dir: Path,
+) -> tuple[int, int]:
+    progress = tqdm(
+        range(cfg.train_steps_per_round),
+        desc=f"dynamics/round_{round_idx}",
+        unit="step",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    latest_actor_metrics: dict[str, float] | None = None
+    for _ in progress:
+        batch = buffer.sample(cfg.batch_size, device)
+        metrics = trainer.train_step(batch)
+        next_train_step = train_step + 1
+        writer.add_scalar("dynamics/train_loss", metrics["loss"], train_step)
+        writer.add_scalar("dynamics/grad_norm", metrics["grad_norm"], train_step)
+        if train_step % 50 == 0:
+            eval_metrics = trainer.eval_step(buffer.sample(cfg.batch_size, device))
+            writer.add_scalar("dynamics/eval_loss", eval_metrics["loss"], train_step)
+            writer.add_scalar("dynamics/eval_cosine", eval_metrics["cosine"], train_step)
+        if next_train_step % cfg.checkpoint_interval == 0:
+            checkpoint_path = save_checkpoint(
+                run_dir=run_dir,
+                model=trainer.model,
+                actor=actor,
+                cfg=cfg,
+                train_step=next_train_step,
+                actor_train_step=actor_train_step,
+                filename="dynamics_model_latest.pt",
+            )
+            tqdm.write(f"checkpoint saved: {checkpoint_path}")
+        if (
+            actor_video_trainer is not None
+            and next_train_step % cfg.actor_train_interval == 0
+        ):
+            actor_progress = tqdm(
+                range(cfg.actor_train_steps),
+                desc=f"actor_video@dyn_{next_train_step}",
+                unit="update",
+                dynamic_ncols=True,
+                leave=False,
+            )
+            for _actor_update in actor_progress:
+                actor_metrics = actor_video_trainer.train_step()
+                latest_actor_metrics = actor_metrics
+                writer.add_scalar(
+                    "actor/train_loss",
+                    actor_metrics["loss"],
+                    actor_train_step,
+                )
+                writer.add_scalar(
+                    "actor/goal_cosine",
+                    actor_metrics["cosine"],
+                    actor_train_step,
+                )
+                writer.add_scalar(
+                    "actor/policy_std_mean",
+                    actor_metrics["actor_std_mean"],
+                    actor_train_step,
+                )
+                writer.add_scalar(
+                    "actor/frame_gap_mean",
+                    actor_metrics["frame_gap_mean"],
+                    actor_train_step,
+                )
+                writer.add_scalar(
+                    "actor/grad_norm",
+                    actor_metrics["grad_norm"],
+                    actor_train_step,
+                )
+                actor_train_step += 1
+                actor_progress.set_postfix(
+                    step=actor_train_step,
+                    loss=f"{actor_metrics['loss']:.4f}",
+                    cos=f"{actor_metrics['cosine']:.3f}",
+                    gap=f"{actor_metrics['frame_gap_mean']:.1f}",
+                )
+        postfix = {
+            "step": next_train_step,
+            "loss": f"{metrics['loss']:.4f}",
+            "delta": f"{metrics['delta_loss']:.4f}",
+            "buffer": len(buffer),
+        }
+        if latest_actor_metrics is not None:
+            postfix["actor_loss"] = f"{latest_actor_metrics['loss']:.4f}"
+            postfix["actor_step"] = actor_train_step
+        progress.set_postfix(postfix)
+        if next_train_step % cfg.log_interval == 0:
+            tqdm.write(
+                f"dynamics step={next_train_step} round={round_idx} "
+                f"loss={metrics['loss']:.6f} delta={metrics['delta_loss']:.6f} "
+                f"grad={metrics['grad_norm']:.3f}"
+            )
+        train_step = next_train_step
+    tqdm.write(
+        f"dynamics/round_{round_idx} done: step={train_step} "
+        f"loss={metrics['loss']:.6f} delta={metrics['delta_loss']:.6f}"
+    )
+    return train_step, actor_train_step
+
+
+def save_checkpoint(
+    *,
+    run_dir: Path,
+    model: ForwardDynamicsModel,
+    actor: StochasticActor,
+    cfg: TrainDynamicsConfig,
+    train_step: int,
+    actor_train_step: int,
+    filename: str,
+) -> Path:
+    checkpoint_path = run_dir / filename
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": asdict(model.config),
+            "actor_state_dict": actor.state_dict(),
+            "actor_config": asdict(actor.config),
+            "train_config": asdict(cfg),
+            "train_step": train_step,
+            "actor_train_step": actor_train_step,
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path
+
+
+@torch.no_grad()
+def sample_actor_action(
+    actor: StochasticActor,
+    state: np.ndarray,
+    device: torch.device,
+) -> tuple[np.ndarray, float]:
+    actor.eval()
+    state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).reshape(1, -1)
+    sample = actor.sample(state_tensor)
+    action = sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return action, float(sample.std.mean().detach().cpu())
+
+
+def encode_observation(
+    backbone: torch.nn.Module,
+    obs: Any,
+    device: torch.device,
+    camera_uid: str | None,
+) -> np.ndarray:
+    rgb = extract_rgb(obs, camera_uid)
+    rgb = np.asarray(rgb)
+    if rgb.ndim == 3:
+        rgb = rgb[None]
+    if rgb.ndim != 4:
+        raise ValueError(f"expected RGB image with rank 3 or 4, got shape {rgb.shape}")
+    if rgb.shape[-1] > 3:
+        rgb = rgb[..., :3]
+    if rgb.shape[-1] != 3:
+        raise ValueError(f"expected RGB image last dim to be 3, got shape {rgb.shape}")
+
+    rgb_tensor = torch.as_tensor(to_rgb_uint8(rgb))
+    features = encode_images(backbone, rgb_tensor, device)
+    return features[0].detach().cpu().numpy().astype(np.float32)
+
+
+def extract_rgb(obs: Any, camera_uid: str | None) -> np.ndarray:
+    if camera_uid is not None:
+        try:
+            rgb = obs["sensor_data"][camera_uid]["rgb"]
+        except KeyError as exc:
+            raise KeyError(f"camera_uid={camera_uid!r} not found in observation") from exc
+        return tensor_to_numpy(rgb)
+
+    found = find_rgb(obs)
+    if found is None:
+        raise KeyError("could not find an 'rgb' image in the ManiSkill observation")
+    return tensor_to_numpy(found)
+
+
+def find_rgb(value: Any) -> Any | None:
+    if isinstance(value, dict):
+        if "rgb" in value:
+            return value["rgb"]
+        for child in value.values():
+            found = find_rgb(child)
+            if found is not None:
+                return found
+    return None
+
+
+def tensor_to_numpy(value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def to_rgb_uint8(rgb: np.ndarray) -> np.ndarray:
+    if rgb.dtype == np.uint8:
+        return rgb
+    rgb_float = rgb.astype(np.float32)
+    if rgb_float.size > 0 and rgb_float.max() <= 1.0:
+        rgb_float = rgb_float * 255.0
+    return np.clip(rgb_float, 0.0, 255.0).astype(np.uint8)
+
+
+def build_actor_video_trainer(
+    *,
+    cfg: TrainDynamicsConfig,
+    actor: StochasticActor,
+    dynamics: ForwardDynamicsModel,
+    backbone: torch.nn.Module,
+    device: torch.device,
+) -> VideoActorTrainer | None:
+    if not cfg.actor_video_training:
+        return None
+
+    sampler = VideoFramePairSampler(
+        cfg.actor_video_dataset_dir,
+        min_gap=cfg.actor_pair_min_gap,
+        max_gap=cfg.actor_pair_max_gap,
+        cache_size=cfg.actor_video_cache_size,
+        seed=cfg.seed,
+    )
+    return VideoActorTrainer(
+        actor=actor,
+        dynamics=dynamics,
+        backbone=backbone,
+        sampler=sampler,
+        config=VideoActorTrainerConfig(
+            lr=cfg.actor_lr,
+            weight_decay=cfg.actor_weight_decay,
+            grad_clip_norm=cfg.actor_grad_clip_norm,
+            rollout_horizon=cfg.actor_rollout_horizon,
+            batch_size=cfg.actor_batch_size,
+        ),
+        device=device,
+    )
+
+
+def run(cfg: TrainDynamicsConfig) -> None:
+    device = select_device(cfg.device)
+    run_dir = create_run_dir(cfg.log_dir, cfg.run_name)
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    env = make_env(cfg)
+    writer = SummaryWriter(log_dir=str(run_dir))
+    try:
+        action_space = getattr(env, "single_action_space", env.action_space)
+        if not isinstance(action_space, gym.spaces.Box):
+            raise TypeError(f"Expected Box action space, got {type(action_space).__name__}")
+        action_dim = int(np.prod(action_space.shape))
+
+        backbone = build_backbone(device, model_id=cfg.r3m_model_id)
+        model = ForwardDynamicsModel(
+            ForwardDynamicsConfig(
+                action_dim=action_dim,
+                state_dim=R3M_FEAT_DIM,
+                hidden_dims=cfg.hidden_dims,
+            )
+        ).to(device)
+        trainer = DynamicsTrainer(
+            model,
+            DynamicsTrainerConfig(
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+                grad_clip_norm=cfg.grad_clip_norm,
+            ),
+        )
+        buffer = TransitionReplayBuffer(
+            cfg.buffer_capacity,
+            state_dim=R3M_FEAT_DIM,
+            action_dim=action_dim,
+            seed=cfg.seed,
+        )
+        actor = StochasticActor(
+            StochasticActorConfig(action_dim=action_dim, state_dim=R3M_FEAT_DIM),
+            action_low=torch.as_tensor(action_space.low, dtype=torch.float32),
+            action_high=torch.as_tensor(action_space.high, dtype=torch.float32),
+        ).to(device)
+        actor_video_trainer = build_actor_video_trainer(
+            cfg=cfg,
+            actor=actor,
+            dynamics=model,
+            backbone=backbone,
+            device=device,
+        )
+
+        writer.add_text("config", repr(cfg), 0)
+        writer.add_text("model", repr(model), 0)
+        writer.add_text("actor", repr(actor), 0)
+        tqdm.write(f"Logging TensorBoard events to {run_dir}")
+        tqdm.write(f"Device: {device} | action_dim={action_dim} | state_dim={R3M_FEAT_DIM}")
+        tqdm.write(
+            f"Plan: collect {cfg.initial_episodes} initial episodes, then run "
+            f"{cfg.collection_rounds} rounds x {cfg.train_steps_per_round} train steps "
+            f"with {cfg.episodes_per_round} new episodes after each round."
+        )
+        if actor_video_trainer is not None:
+            tqdm.write(
+                f"Actor video training: every {cfg.actor_train_interval} dynamics steps, "
+                f"{cfg.actor_train_steps} actor updates, horizon={cfg.actor_rollout_horizon}, "
+                f"dataset={cfg.actor_video_dataset_dir}"
+            )
+
+        global_episode, global_step, train_step, actor_train_step = 0, 0, 0, 0
+        initial_cfg = TrainDynamicsConfig(
+            **{
+                **cfg.__dict__,
+                "episodes_per_round": cfg.initial_episodes,
+            }
+        )
+        global_episode, global_step = collect_actor_episodes(
+            env=env,
+            actor=actor,
+            buffer=buffer,
+            backbone=backbone,
+            device=device,
+            cfg=initial_cfg,
+            writer=writer,
+            global_episode=global_episode,
+            global_step=global_step,
+            phase="initial_collect",
+        )
+
+        for round_idx in range(cfg.collection_rounds):
+            tqdm.write(f"== dynamics training round {round_idx} ==")
+            train_step, actor_train_step = train_round(
+                trainer=trainer,
+                actor=actor,
+                actor_video_trainer=actor_video_trainer,
+                buffer=buffer,
+                cfg=cfg,
+                writer=writer,
+                device=device,
+                train_step=train_step,
+                actor_train_step=actor_train_step,
+                round_idx=round_idx,
+                run_dir=run_dir,
+            )
+            writer.add_scalar("progress/round", round_idx, train_step)
+            tqdm.write(f"== sample generation round {round_idx} ==")
+            global_episode, global_step = collect_actor_episodes(
+                env=env,
+                actor=actor,
+                buffer=buffer,
+                backbone=backbone,
+                device=device,
+                cfg=cfg,
+                writer=writer,
+                global_episode=global_episode,
+                global_step=global_step,
+                phase=f"collect_round_{round_idx}",
+            )
+
+        checkpoint_path = save_checkpoint(
+            run_dir=run_dir,
+            model=model,
+            actor=actor,
+            cfg=cfg,
+            train_step=train_step,
+            actor_train_step=actor_train_step,
+            filename="dynamics_model.pt",
+        )
+        tqdm.write(
+            f"Finished training: episodes={global_episode} transitions={len(buffer)} "
+            f"env_steps={global_step} train_steps={train_step} "
+            f"actor_train_steps={actor_train_step}"
+        )
+        tqdm.write(f"Saved dynamics checkpoint to {checkpoint_path}")
+    finally:
+        writer.close()
+        env.close()
+
+
+def main() -> None:
+    run(parse_args())
+
+
+if __name__ == "__main__":
+    main()
