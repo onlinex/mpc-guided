@@ -8,8 +8,12 @@ from dataclasses import dataclass
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
 import numpy as np
+import torch
 
+from src.actor import StochasticActor, StochasticActorConfig
+from src.backbone import build_backbone, encode_images
 from src.rollout import rollout
+from src.utils import pick_device
 
 
 ENV_ID = "PickCube-v1"
@@ -30,6 +34,10 @@ class DemoConfig:
     episodes: int = 5
     max_steps: int = 200
     action_chunk_size: int = 1
+    checkpoint: str | None = None
+    r3m_model_id: str = "resnet18"
+    device: str = "auto"
+    deterministic: bool = True
 
 
 class SpaceActor:
@@ -66,6 +74,80 @@ class SpaceActor:
         return np.asarray(self.action_space.sample(), dtype=np.float32)
 
 
+class CheckpointActor:
+    """Wraps a trained ``StochasticActor`` plus an R3M backbone for env rollouts."""
+
+    def __init__(
+        self,
+        *,
+        actor: StochasticActor,
+        backbone: torch.nn.Module,
+        device: torch.device,
+        camera_uid: str,
+        action_chunk_size: int,
+        deterministic: bool,
+    ) -> None:
+        self.actor = actor
+        self.backbone = backbone
+        self.device = device
+        self.camera_uid = camera_uid
+        self.action_chunk_size = action_chunk_size
+        self.deterministic = deterministic
+
+    def reset(self) -> None:
+        pass
+
+    @torch.no_grad()
+    def __call__(self, obs) -> np.ndarray:
+        rgb = _extract_rgb(obs, self.camera_uid)
+        rgb_tensor = torch.as_tensor(_to_rgb_uint8(rgb))
+        if rgb_tensor.ndim == 3:
+            rgb_tensor = rgb_tensor.unsqueeze(0)
+        state = encode_images(self.backbone, rgb_tensor, self.device)
+        sample = self.actor.sample(state, deterministic=self.deterministic)
+        action = sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        return np.repeat(action.reshape(1, -1), self.action_chunk_size, axis=0)
+
+
+def _extract_rgb(obs, camera_uid: str) -> np.ndarray:
+    rgb = obs["sensor_data"][camera_uid]["rgb"]
+    if isinstance(rgb, torch.Tensor):
+        rgb = rgb.detach().cpu().numpy()
+    return np.asarray(rgb)
+
+
+def _to_rgb_uint8(rgb: np.ndarray) -> np.ndarray:
+    if rgb.ndim == 4:
+        rgb = rgb[..., :3]
+    elif rgb.ndim == 3:
+        rgb = rgb[..., :3]
+    if rgb.dtype == np.uint8:
+        return rgb
+    rgb_float = rgb.astype(np.float32)
+    if rgb_float.size > 0 and rgb_float.max() <= 1.0:
+        rgb_float = rgb_float * 255.0
+    return np.clip(rgb_float, 0.0, 255.0).astype(np.uint8)
+
+
+def load_actor_from_checkpoint(
+    path: str,
+    *,
+    device: torch.device,
+) -> StochasticActor:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    actor_config = StochasticActorConfig(**ckpt["actor_config"])
+    action_low = ckpt["action_low"]
+    action_high = ckpt["action_high"]
+    actor = StochasticActor(
+        actor_config,
+        action_low=action_low,
+        action_high=action_high,
+    ).to(device)
+    actor.load_state_dict(ckpt["actor_state_dict"])
+    actor.eval()
+    return actor
+
+
 def parse_args() -> DemoConfig:
     defaults = DemoConfig()
     p = argparse.ArgumentParser(description=__doc__)
@@ -82,6 +164,19 @@ def parse_args() -> DemoConfig:
     p.add_argument("--episodes", type=int, default=defaults.episodes)
     p.add_argument("--max-steps", type=int, default=defaults.max_steps)
     p.add_argument("--action-chunk-size", type=int, default=defaults.action_chunk_size)
+    p.add_argument(
+        "--checkpoint",
+        default=defaults.checkpoint,
+        help="Path to a trained actor checkpoint (.pt). When set, overrides --policy and forces obs_mode=rgb.",
+    )
+    p.add_argument("--r3m-model-id", default=defaults.r3m_model_id)
+    p.add_argument("--device", default=defaults.device)
+    p.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.deterministic,
+        help="Use the actor's mean action instead of sampling.",
+    )
     args = p.parse_args()
     if args.episodes < 1:
         p.error("--episodes must be >= 1.")
@@ -89,11 +184,15 @@ def parse_args() -> DemoConfig:
         p.error("--max-steps must be >= 1.")
     if args.action_chunk_size < 1:
         p.error("--action-chunk-size must be >= 1.")
-    if args.obs_mode == "rgb" and args.render_backend == "none":
-        p.error("--render-backend none is incompatible with --obs-mode rgb.")
+    obs_mode = args.obs_mode
+    if args.checkpoint is not None:
+        obs_mode = "rgb"
+    if obs_mode == "rgb" and args.render_backend == "none":
+        p.error("--render-backend none is incompatible with --obs-mode rgb / --checkpoint.")
     return DemoConfig(
         **{
             **vars(args),
+            "obs_mode": obs_mode,
             "render_mode": None if args.render_mode == "none" else args.render_mode,
         }
     )
@@ -121,15 +220,30 @@ def run(cfg: DemoConfig) -> None:
         action_space = getattr(env, "single_action_space", env.action_space)
         if not isinstance(action_space, gym.spaces.Box):
             raise TypeError(f"Expected Box action space, got {type(action_space).__name__}.")
-        actor = SpaceActor(
-            action_space,
-            policy=cfg.policy,
-            action_chunk_size=cfg.action_chunk_size,
-            seed=cfg.seed,
-        )
+        if cfg.checkpoint is not None:
+            device = pick_device() if cfg.device == "auto" else torch.device(cfg.device)
+            backbone = build_backbone(device, model_id=cfg.r3m_model_id)
+            loaded_actor = load_actor_from_checkpoint(cfg.checkpoint, device=device)
+            actor = CheckpointActor(
+                actor=loaded_actor,
+                backbone=backbone,
+                device=device,
+                camera_uid="base_camera",
+                action_chunk_size=cfg.action_chunk_size,
+                deterministic=cfg.deterministic,
+            )
+            policy_label = f"checkpoint:{cfg.checkpoint}"
+        else:
+            actor = SpaceActor(
+                action_space,
+                policy=cfg.policy,
+                action_chunk_size=cfg.action_chunk_size,
+                seed=cfg.seed,
+            )
+            policy_label = cfg.policy
 
         print(
-            f"Env: {cfg.env_id} | obs_mode={cfg.obs_mode} | policy={cfg.policy} | "
+            f"Env: {cfg.env_id} | obs_mode={cfg.obs_mode} | policy={policy_label} | "
             f"sim_backend={cfg.sim_backend} | render_backend={cfg.render_backend}",
             flush=True,
         )

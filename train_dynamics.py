@@ -22,7 +22,13 @@ from src.actor import (
     VideoActorTrainer,
     VideoActorTrainerConfig,
 )
-from src.backbone import R3M_FEAT_DIM, R3M_MODEL_IDS, build_backbone, encode_images
+from src.backbone import (
+    BACKBONE_PRECISIONS,
+    R3M_FEAT_DIM,
+    R3M_MODEL_IDS,
+    build_backbone,
+    encode_images,
+)
 from src.datasets.video_pairs import VideoFramePairSampler
 from src.dynamics import (
     DynamicsTrainer,
@@ -48,13 +54,14 @@ class TrainDynamicsConfig:
     camera_width: int = 224
     camera_height: int = 224
     r3m_model_id: str = "resnet18"
+    backbone_precision: str = "fp32"
     seed: int = 0
     initial_episodes: int = 16
-    collection_rounds: int = 10
-    episodes_per_round: int = 8
+    collection_rounds: int = 40
+    episodes_per_round: int = 16
     max_steps: int = 100
     buffer_capacity: int = 50_000
-    train_steps_per_round: int = 1000
+    train_steps_per_round: int = 300
     batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -63,16 +70,17 @@ class TrainDynamicsConfig:
     log_dir: str = "runs/dynamics"
     run_name: str | None = None
     log_interval: int = 50
-    checkpoint_interval: int = 1000
+    checkpoint_interval: int = 300
     actor_video_training: bool = True
     actor_video_dataset_dir: str = "data/pickcube_expert_videos"
-    actor_train_interval: int = 250
+    actor_train_interval: int = 50
     actor_train_steps: int = 10
     actor_batch_size: int = 32
     actor_rollout_horizon: int = 1
     actor_pair_min_gap: int = 1
     actor_pair_max_gap: int = 1
     actor_video_cache_size: int = 8
+    actor_pairs_per_video: int = 8
     actor_lr: float = 3e-4
     actor_weight_decay: float = 1e-4
     actor_grad_clip_norm: float | None = 10.0
@@ -90,6 +98,12 @@ def parse_args() -> TrainDynamicsConfig:
     p.add_argument("--camera-width", type=int, default=defaults.camera_width)
     p.add_argument("--camera-height", type=int, default=defaults.camera_height)
     p.add_argument("--r3m-model-id", choices=R3M_MODEL_IDS, default=defaults.r3m_model_id)
+    p.add_argument(
+        "--backbone-precision",
+        choices=BACKBONE_PRECISIONS,
+        default=defaults.backbone_precision,
+        help="R3M forward dtype. bf16/fp16 are ~2x faster on CUDA; backbone is frozen so no accuracy concern.",
+    )
     p.add_argument("--seed", type=int, default=defaults.seed)
     p.add_argument("--initial-episodes", type=int, default=defaults.initial_episodes)
     p.add_argument("--collection-rounds", type=int, default=defaults.collection_rounds)
@@ -119,6 +133,12 @@ def parse_args() -> TrainDynamicsConfig:
     p.add_argument("--actor-pair-min-gap", type=int, default=defaults.actor_pair_min_gap)
     p.add_argument("--actor-pair-max-gap", type=int, default=defaults.actor_pair_max_gap)
     p.add_argument("--actor-video-cache-size", type=int, default=defaults.actor_video_cache_size)
+    p.add_argument(
+        "--actor-pairs-per-video",
+        type=int,
+        default=defaults.actor_pairs_per_video,
+        help="Number of (start, goal) pairs drawn per loaded video — reduces decode/cache pressure.",
+    )
     p.add_argument("--actor-lr", type=float, default=defaults.actor_lr)
     p.add_argument("--actor-weight-decay", type=float, default=defaults.actor_weight_decay)
     p.add_argument("--actor-grad-clip-norm", type=float, default=defaults.actor_grad_clip_norm)
@@ -145,6 +165,7 @@ def parse_args() -> TrainDynamicsConfig:
         "actor_pair_min_gap",
         "actor_pair_max_gap",
         "actor_video_cache_size",
+        "actor_pairs_per_video",
     ):
         if getattr(args, field) < 1:
             p.error(f"--{field.replace('_', '-')} must be >= 1")
@@ -305,14 +326,13 @@ def train_round(
         if next_train_step % cfg.checkpoint_interval == 0:
             checkpoint_path = save_checkpoint(
                 run_dir=run_dir,
-                model=trainer.model,
                 actor=actor,
                 cfg=cfg,
                 train_step=next_train_step,
                 actor_train_step=actor_train_step,
-                filename="dynamics_model_latest.pt",
+                filename="actor_latest.pt",
             )
-            tqdm.write(f"checkpoint saved: {checkpoint_path}")
+            tqdm.write(f"actor checkpoint saved: {checkpoint_path}")
         if (
             actor_video_trainer is not None
             and next_train_step % cfg.actor_train_interval == 0
@@ -386,7 +406,6 @@ def train_round(
 def save_checkpoint(
     *,
     run_dir: Path,
-    model: ForwardDynamicsModel,
     actor: StochasticActor,
     cfg: TrainDynamicsConfig,
     train_step: int,
@@ -396,10 +415,10 @@ def save_checkpoint(
     checkpoint_path = run_dir / filename
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
-            "model_config": asdict(model.config),
             "actor_state_dict": actor.state_dict(),
             "actor_config": asdict(actor.config),
+            "action_low": actor.action_low.detach().cpu(),
+            "action_high": actor.action_high.detach().cpu(),
             "train_config": asdict(cfg),
             "train_step": train_step,
             "actor_train_step": actor_train_step,
@@ -500,6 +519,7 @@ def build_actor_video_trainer(
         min_gap=cfg.actor_pair_min_gap,
         max_gap=cfg.actor_pair_max_gap,
         cache_size=cfg.actor_video_cache_size,
+        pairs_per_video=cfg.actor_pairs_per_video,
         seed=cfg.seed,
     )
     return VideoActorTrainer(
@@ -532,7 +552,11 @@ def run(cfg: TrainDynamicsConfig) -> None:
             raise TypeError(f"Expected Box action space, got {type(action_space).__name__}")
         action_dim = int(np.prod(action_space.shape))
 
-        backbone = build_backbone(device, model_id=cfg.r3m_model_id)
+        backbone = build_backbone(
+            device,
+            model_id=cfg.r3m_model_id,
+            precision=cfg.backbone_precision,
+        )
         model = ForwardDynamicsModel(
             ForwardDynamicsConfig(
                 action_dim=action_dim,
@@ -636,19 +660,18 @@ def run(cfg: TrainDynamicsConfig) -> None:
 
         checkpoint_path = save_checkpoint(
             run_dir=run_dir,
-            model=model,
             actor=actor,
             cfg=cfg,
             train_step=train_step,
             actor_train_step=actor_train_step,
-            filename="dynamics_model.pt",
+            filename="actor.pt",
         )
         tqdm.write(
             f"Finished training: episodes={global_episode} transitions={len(buffer)} "
             f"env_steps={global_step} train_steps={train_step} "
             f"actor_train_steps={actor_train_step}"
         )
-        tqdm.write(f"Saved dynamics checkpoint to {checkpoint_path}")
+        tqdm.write(f"Saved actor checkpoint to {checkpoint_path}")
     finally:
         writer.close()
         env.close()

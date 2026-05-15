@@ -27,26 +27,48 @@ def preprocess_rgb(rgb_uint8: torch.Tensor) -> torch.Tensor:
     return F.interpolate(x, size=R3M_INPUT_SIZE, mode="bilinear", align_corners=False)
 
 
+BACKBONE_PRECISIONS = ("fp32", "fp16", "bf16")
+
+
+def _resolve_precision(precision: str) -> torch.dtype:
+    if precision == "fp32":
+        return torch.float32
+    if precision == "fp16":
+        return torch.float16
+    if precision == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported precision={precision!r}; expected one of {BACKBONE_PRECISIONS}.")
+
+
 def build_backbone(
     device: torch.device,
     model_id: str = R3M_MODEL_ID,
+    precision: str = "fp32",
 ) -> nn.Module:
     if model_id not in R3M_MODEL_IDS:
         raise ValueError(f"Unsupported R3M model_id={model_id!r}; expected one of {R3M_MODEL_IDS}.")
-    backbone = load_r3m(model_id).to(device).eval()
+    dtype = _resolve_precision(precision)
+    backbone = load_r3m(model_id).to(device=device, dtype=dtype).eval()
     for p in backbone.parameters():
         p.requires_grad_(False)
     return backbone
 
 
+def _backbone_dtype(backbone: nn.Module) -> torch.dtype:
+    return next(backbone.parameters()).dtype
+
+
 def encode_images(backbone: nn.Module, rgb_uint8: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Preprocess images and return frozen ``(B, 512)`` R3M features."""
-    images = preprocess_rgb(rgb_uint8.to(device))
+    """Preprocess images and return frozen ``(B, 512)`` R3M features in float32."""
+    dtype = _backbone_dtype(backbone)
+    images = preprocess_rgb(rgb_uint8.to(device)).to(dtype)
     with torch.no_grad():
-        return backbone(images)
+        features = backbone(images)
+    return features.to(torch.float32)
 
 
 def encode_images_grad(backbone: nn.Module, rgb_uint8: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Like ``encode_images`` but keeps the forward pass in autograd."""
-    images = preprocess_rgb(rgb_uint8.to(device))
-    return backbone(images)
+    dtype = _backbone_dtype(backbone)
+    images = preprocess_rgb(rgb_uint8.to(device)).to(dtype)
+    return backbone(images).to(torch.float32)

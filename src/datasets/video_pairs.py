@@ -37,6 +37,7 @@ class VideoFramePairSampler:
         min_gap: int,
         max_gap: int,
         cache_size: int = 8,
+        pairs_per_video: int = 1,
         seed: int = 0,
     ) -> None:
         if min_gap < 1:
@@ -45,12 +46,15 @@ class VideoFramePairSampler:
             raise ValueError(f"max_gap must be >= min_gap, got {max_gap} < {min_gap}")
         if cache_size < 1:
             raise ValueError(f"cache_size must be >= 1, got {cache_size}")
+        if pairs_per_video < 1:
+            raise ValueError(f"pairs_per_video must be >= 1, got {pairs_per_video}")
 
         self.dataset_dir = Path(dataset_dir)
         self.records = load_video_records(self.dataset_dir)
         self.min_gap = min_gap
         self.max_gap = max_gap
         self.cache_size = cache_size
+        self.pairs_per_video = pairs_per_video
         self.rng = np.random.default_rng(seed)
         self._cache: OrderedDict[Path, np.ndarray] = OrderedDict()
 
@@ -59,13 +63,17 @@ class VideoFramePairSampler:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
         starts, goals, gaps = [], [], []
-        for _ in range(batch_size):
+        remaining = batch_size
+        while remaining > 0:
             record = self.records[int(self.rng.integers(0, len(self.records)))]
             video = self._load_video(record.video_path)
-            start_idx, goal_idx = self._sample_indices(len(video))
-            starts.append(video[start_idx])
-            goals.append(video[goal_idx])
-            gaps.append(goal_idx - start_idx)
+            num_pairs = min(self.pairs_per_video, remaining)
+            for _ in range(num_pairs):
+                start_idx, goal_idx = self._sample_indices(len(video))
+                starts.append(video[start_idx])
+                goals.append(video[goal_idx])
+                gaps.append(goal_idx - start_idx)
+            remaining -= num_pairs
 
         return VideoPairBatch(
             start_rgb=torch.as_tensor(np.stack(starts), dtype=torch.uint8, device=device),
