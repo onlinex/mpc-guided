@@ -62,10 +62,14 @@ class DynamicsTrainer:
         target_delta = batch.next_state - batch.state
         delta_loss = F.mse_loss(delta, target_delta)
         cosine = F.cosine_similarity(pred_next_state, batch.next_state, dim=-1).mean()
+        identity_loss = F.mse_loss(batch.state, batch.next_state)
+        identity_loss_ratio = loss / identity_loss.clamp(min=1e-12)
         return {
             "loss": float(loss.cpu()),
             "delta_loss": float(delta_loss.cpu()),
             "cosine": float(cosine.cpu()),
+            "identity_loss": float(identity_loss.cpu()),
+            "identity_loss_ratio": float(identity_loss_ratio.cpu()),
         }
 
     def _clip_grad_norm(self) -> float:

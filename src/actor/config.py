@@ -18,7 +18,7 @@ class StochasticActorConfig:
     layer_norm: bool = True
     dropout: float = 0.0
     log_std_min: float = -5.0
-    log_std_max: float = 0.5
+    log_std_max: float = -1.0
 
 
 @dataclass(frozen=True)

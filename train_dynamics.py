@@ -58,31 +58,28 @@ class TrainDynamicsConfig:
     seed: int = 0
     initial_episodes: int = 16
     collection_rounds: int = 40
-    episodes_per_round: int = 16
+    episodes_per_round: int = 32
     max_steps: int = 100
     buffer_capacity: int = 50_000
-    train_steps_per_round: int = 300
-    batch_size: int = 256
+    train_steps_per_round: int = 100
+    batch_size: int = 128
     lr: float = 3e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-3
     grad_clip_norm: float | None = 10.0
     hidden_dims: tuple[int, ...] = (512, 512)
     log_dir: str = "runs/dynamics"
     run_name: str | None = None
     log_interval: int = 50
-    checkpoint_interval: int = 300
     actor_video_training: bool = True
     actor_video_dataset_dir: str = "data/pickcube_expert_videos"
-    actor_train_interval: int = 50
-    actor_train_steps: int = 10
+    actor_train_steps_per_round: int = 30
     actor_batch_size: int = 32
-    actor_rollout_horizon: int = 1
     actor_pair_min_gap: int = 1
-    actor_pair_max_gap: int = 1
+    actor_pair_max_gap: int = 5
     actor_video_cache_size: int = 8
     actor_pairs_per_video: int = 8
     actor_lr: float = 3e-4
-    actor_weight_decay: float = 1e-4
+    actor_weight_decay: float = 1e-3
     actor_grad_clip_norm: float | None = 10.0
     device: str = "auto"
 
@@ -119,17 +116,19 @@ def parse_args() -> TrainDynamicsConfig:
     p.add_argument("--log-dir", default=defaults.log_dir)
     p.add_argument("--run-name", default=defaults.run_name)
     p.add_argument("--log-interval", type=int, default=defaults.log_interval)
-    p.add_argument("--checkpoint-interval", type=int, default=defaults.checkpoint_interval)
     p.add_argument(
         "--actor-video-training",
         action=argparse.BooleanOptionalAction,
         default=defaults.actor_video_training,
     )
     p.add_argument("--actor-video-dataset-dir", default=defaults.actor_video_dataset_dir)
-    p.add_argument("--actor-train-interval", type=int, default=defaults.actor_train_interval)
-    p.add_argument("--actor-train-steps", type=int, default=defaults.actor_train_steps)
+    p.add_argument(
+        "--actor-train-steps-per-round",
+        type=int,
+        default=defaults.actor_train_steps_per_round,
+        help="Actor updates per round, run after the dynamics phase against the just-trained dynamics.",
+    )
     p.add_argument("--actor-batch-size", type=int, default=defaults.actor_batch_size)
-    p.add_argument("--actor-rollout-horizon", type=int, default=defaults.actor_rollout_horizon)
     p.add_argument("--actor-pair-min-gap", type=int, default=defaults.actor_pair_min_gap)
     p.add_argument("--actor-pair-max-gap", type=int, default=defaults.actor_pair_max_gap)
     p.add_argument("--actor-video-cache-size", type=int, default=defaults.actor_video_cache_size)
@@ -157,11 +156,7 @@ def parse_args() -> TrainDynamicsConfig:
         "train_steps_per_round",
         "batch_size",
         "log_interval",
-        "checkpoint_interval",
-        "actor_train_interval",
-        "actor_train_steps",
         "actor_batch_size",
-        "actor_rollout_horizon",
         "actor_pair_min_gap",
         "actor_pair_max_gap",
         "actor_video_cache_size",
@@ -169,6 +164,8 @@ def parse_args() -> TrainDynamicsConfig:
     ):
         if getattr(args, field) < 1:
             p.error(f"--{field.replace('_', '-')} must be >= 1")
+    if args.actor_train_steps_per_round < 0:
+        p.error("--actor-train-steps-per-round must be >= 0")
     if args.actor_pair_max_gap < args.actor_pair_min_gap:
         p.error("--actor-pair-max-gap must be >= --actor-pair-min-gap")
     return TrainDynamicsConfig(
@@ -247,12 +244,14 @@ def collect_actor_episodes(
         state = encode_observation(backbone, obs, device, cfg.camera_uid)
         ep_return, succeeded = 0.0, False
         action_abs_sum, actor_std_sum = 0.0, 0.0
+        episode_actions: list[np.ndarray] = []
         for ep_step in range(cfg.max_steps):
             action, actor_std = sample_actor_action(actor, state, device)
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_state = encode_observation(backbone, next_obs, device, cfg.camera_uid)
             buffer.add(state, action, next_state)
 
+            episode_actions.append(action)
             ep_return += float(np.asarray(reward).reshape(-1)[0])
             action_abs_sum += float(np.abs(action).mean())
             actor_std_sum += actor_std
@@ -264,6 +263,11 @@ def collect_actor_episodes(
             if done:
                 break
 
+        action_within_episode_std = (
+            float(np.stack(episode_actions, axis=0).std(axis=0).mean())
+            if len(episode_actions) > 1
+            else 0.0
+        )
         writer.add_scalar("rollout/episode_return", ep_return, global_episode)
         writer.add_scalar("rollout/episode_success", float(succeeded), global_episode)
         writer.add_scalar("rollout/episode_steps", ep_step + 1, global_episode)
@@ -275,6 +279,11 @@ def collect_actor_episodes(
         writer.add_scalar(
             "rollout/policy_std_mean",
             actor_std_sum / (ep_step + 1),
+            global_episode,
+        )
+        writer.add_scalar(
+            "rollout/action_within_episode_std",
+            action_within_episode_std,
             global_episode,
         )
         writer.add_scalar("replay_buffer/size", len(buffer), global_step)
@@ -305,6 +314,48 @@ def train_round(
     round_idx: int,
     run_dir: Path,
 ) -> tuple[int, int]:
+    train_step, last_dyn_metrics = _train_dynamics_phase(
+        trainer=trainer,
+        buffer=buffer,
+        cfg=cfg,
+        writer=writer,
+        device=device,
+        train_step=train_step,
+        round_idx=round_idx,
+    )
+    actor_train_step = _train_actor_phase(
+        actor_video_trainer=actor_video_trainer,
+        cfg=cfg,
+        writer=writer,
+        actor_train_step=actor_train_step,
+        round_idx=round_idx,
+    )
+    checkpoint_path = save_checkpoint(
+        run_dir=run_dir,
+        actor=actor,
+        cfg=cfg,
+        train_step=train_step,
+        actor_train_step=actor_train_step,
+        filename="actor_latest.pt",
+    )
+    tqdm.write(
+        f"round_{round_idx} done: dyn_step={train_step} "
+        f"loss={last_dyn_metrics['loss']:.6f} delta={last_dyn_metrics['delta_loss']:.6f} "
+        f"actor_step={actor_train_step} | checkpoint: {checkpoint_path}"
+    )
+    return train_step, actor_train_step
+
+
+def _train_dynamics_phase(
+    *,
+    trainer: DynamicsTrainer,
+    buffer: TransitionReplayBuffer,
+    cfg: TrainDynamicsConfig,
+    writer: SummaryWriter,
+    device: torch.device,
+    train_step: int,
+    round_idx: int,
+) -> tuple[int, dict[str, float]]:
     progress = tqdm(
         range(cfg.train_steps_per_round),
         desc=f"dynamics/round_{round_idx}",
@@ -312,7 +363,7 @@ def train_round(
         dynamic_ncols=True,
         leave=True,
     )
-    latest_actor_metrics: dict[str, float] | None = None
+    metrics: dict[str, float] = {"loss": float("nan"), "delta_loss": float("nan"), "grad_norm": float("nan")}
     for _ in progress:
         batch = buffer.sample(cfg.batch_size, device)
         metrics = trainer.train_step(batch)
@@ -323,72 +374,17 @@ def train_round(
             eval_metrics = trainer.eval_step(buffer.sample(cfg.batch_size, device))
             writer.add_scalar("dynamics/eval_loss", eval_metrics["loss"], train_step)
             writer.add_scalar("dynamics/eval_cosine", eval_metrics["cosine"], train_step)
-        if next_train_step % cfg.checkpoint_interval == 0:
-            checkpoint_path = save_checkpoint(
-                run_dir=run_dir,
-                actor=actor,
-                cfg=cfg,
-                train_step=next_train_step,
-                actor_train_step=actor_train_step,
-                filename="actor_latest.pt",
+            writer.add_scalar(
+                "dynamics/identity_loss_ratio",
+                eval_metrics["identity_loss_ratio"],
+                train_step,
             )
-            tqdm.write(f"actor checkpoint saved: {checkpoint_path}")
-        if (
-            actor_video_trainer is not None
-            and next_train_step % cfg.actor_train_interval == 0
-        ):
-            actor_progress = tqdm(
-                range(cfg.actor_train_steps),
-                desc=f"actor_video@dyn_{next_train_step}",
-                unit="update",
-                dynamic_ncols=True,
-                leave=False,
-            )
-            for _actor_update in actor_progress:
-                actor_metrics = actor_video_trainer.train_step()
-                latest_actor_metrics = actor_metrics
-                writer.add_scalar(
-                    "actor/train_loss",
-                    actor_metrics["loss"],
-                    actor_train_step,
-                )
-                writer.add_scalar(
-                    "actor/goal_cosine",
-                    actor_metrics["cosine"],
-                    actor_train_step,
-                )
-                writer.add_scalar(
-                    "actor/policy_std_mean",
-                    actor_metrics["actor_std_mean"],
-                    actor_train_step,
-                )
-                writer.add_scalar(
-                    "actor/frame_gap_mean",
-                    actor_metrics["frame_gap_mean"],
-                    actor_train_step,
-                )
-                writer.add_scalar(
-                    "actor/grad_norm",
-                    actor_metrics["grad_norm"],
-                    actor_train_step,
-                )
-                actor_train_step += 1
-                actor_progress.set_postfix(
-                    step=actor_train_step,
-                    loss=f"{actor_metrics['loss']:.4f}",
-                    cos=f"{actor_metrics['cosine']:.3f}",
-                    gap=f"{actor_metrics['frame_gap_mean']:.1f}",
-                )
-        postfix = {
-            "step": next_train_step,
-            "loss": f"{metrics['loss']:.4f}",
-            "delta": f"{metrics['delta_loss']:.4f}",
-            "buffer": len(buffer),
-        }
-        if latest_actor_metrics is not None:
-            postfix["actor_loss"] = f"{latest_actor_metrics['loss']:.4f}"
-            postfix["actor_step"] = actor_train_step
-        progress.set_postfix(postfix)
+        progress.set_postfix(
+            step=next_train_step,
+            loss=f"{metrics['loss']:.4f}",
+            delta=f"{metrics['delta_loss']:.4f}",
+            buffer=len(buffer),
+        )
         if next_train_step % cfg.log_interval == 0:
             tqdm.write(
                 f"dynamics step={next_train_step} round={round_idx} "
@@ -396,11 +392,40 @@ def train_round(
                 f"grad={metrics['grad_norm']:.3f}"
             )
         train_step = next_train_step
-    tqdm.write(
-        f"dynamics/round_{round_idx} done: step={train_step} "
-        f"loss={metrics['loss']:.6f} delta={metrics['delta_loss']:.6f}"
+    return train_step, metrics
+
+
+def _train_actor_phase(
+    *,
+    actor_video_trainer: VideoActorTrainer | None,
+    cfg: TrainDynamicsConfig,
+    writer: SummaryWriter,
+    actor_train_step: int,
+    round_idx: int,
+) -> int:
+    if actor_video_trainer is None or cfg.actor_train_steps_per_round == 0:
+        return actor_train_step
+    progress = tqdm(
+        range(cfg.actor_train_steps_per_round),
+        desc=f"actor/round_{round_idx}",
+        unit="step",
+        dynamic_ncols=True,
+        leave=True,
     )
-    return train_step, actor_train_step
+    for _ in progress:
+        actor_metrics = actor_video_trainer.train_step()
+        writer.add_scalar("actor/train_loss", actor_metrics["loss"], actor_train_step)
+        writer.add_scalar("actor/goal_cosine", actor_metrics["cosine"], actor_train_step)
+        writer.add_scalar("actor/frame_gap_mean", actor_metrics["frame_gap_mean"], actor_train_step)
+        writer.add_scalar("actor/grad_norm", actor_metrics["grad_norm"], actor_train_step)
+        actor_train_step += 1
+        progress.set_postfix(
+            step=actor_train_step,
+            loss=f"{actor_metrics['loss']:.4f}",
+            cos=f"{actor_metrics['cosine']:.3f}",
+            gap=f"{actor_metrics['frame_gap_mean']:.1f}",
+        )
+    return actor_train_step
 
 
 def save_checkpoint(
@@ -531,7 +556,6 @@ def build_actor_video_trainer(
             lr=cfg.actor_lr,
             weight_decay=cfg.actor_weight_decay,
             grad_clip_norm=cfg.actor_grad_clip_norm,
-            rollout_horizon=cfg.actor_rollout_horizon,
             batch_size=cfg.actor_batch_size,
         ),
         device=device,
@@ -603,8 +627,9 @@ def run(cfg: TrainDynamicsConfig) -> None:
         )
         if actor_video_trainer is not None:
             tqdm.write(
-                f"Actor video training: every {cfg.actor_train_interval} dynamics steps, "
-                f"{cfg.actor_train_steps} actor updates, horizon={cfg.actor_rollout_horizon}, "
+                f"Actor video training: {cfg.actor_train_steps_per_round} updates per round "
+                f"(after dynamics phase), horizon=gap "
+                f"~U[{cfg.actor_pair_min_gap},{cfg.actor_pair_max_gap}], "
                 f"dataset={cfg.actor_video_dataset_dir}"
             )
 

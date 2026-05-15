@@ -24,7 +24,17 @@ RGB observation rollout:
 uv run python demo.py --obs-mode rgb --render-mode rgb_array --episodes 1 --max-steps 50
 ```
 
-## Visual Dynamics Model
+Play back a trained actor checkpoint in sim:
+
+```bash
+uv run python demo.py --checkpoint runs/dynamics/<RUN>/actor.pt --episodes 3 --max-steps 100
+```
+
+`--checkpoint` forces `--obs-mode rgb`, builds the R3M backbone, and uses the
+actor's deterministic mean action by default. Pass `--no-deterministic` to
+sample stochastic actions instead.
+
+## Visual Dynamics Model and Goal-State BC Actor
 
 The reusable forward dynamics components live in `src/dynamics/`.
 `ForwardDynamicsModel` consumes an R3M visual feature state `(B, 512)` and a
@@ -32,37 +42,42 @@ robot action `(B, action_dim)`, and returns the predicted next visual feature
 state `(B, 512)`. Rollout actions are sampled by the squashed Gaussian
 `StochasticActor` in `src/actor/`.
 
-Train it from ManiSkill interaction sampled by the stochastic actor:
+`train_dynamics.py` jointly trains both, alternating per round between:
+
+1. **Collect** episodes in ManiSkill with the current actor.
+2. **Dynamics phase** — `--train-steps-per-round` updates against the buffer.
+3. **Actor phase** — `--actor-train-steps-per-round` BC-on-goal updates against
+   the just-trained dynamics. Each step samples (start, goal) frame pairs from
+   the expert video dataset, encodes both with R3M, rolls the actor through
+   frozen dynamics for `--actor-rollout-horizon` steps, and minimizes MSE
+   between the predicted final latent and the goal latent.
+4. **Checkpoint** — saves `actor_latest.pt` at the end of every round; `actor.pt`
+   is written once at the end of the run.
 
 ```bash
 uv run python train_dynamics.py --run-name pickcube-actor-v1
 ```
 
-By default this collects 16 initial actor-sampled episodes, then runs 10 rounds
-of 1000 gradient steps with 8 more actor-sampled episodes collected after each
-round. The trainer uses R3M `resnet18` by default. Each invocation writes to a
-timestamped directory under `runs/dynamics`, for example
-`runs/dynamics/20260515-142233`, and saves `dynamics_model.pt` inside that run
-directory. Intermediate checkpoints overwrite `dynamics_model_latest.pt` every
-1000 training steps by default.
-
-During dynamics training, the actor is also trained from the expert video
-dataset every 250 dynamics steps by default. That loop samples a start and goal
-video frame one timestep apart, encodes both with R3M, rolls the actor through
-the current learned dynamics for 1 step, and optimizes actor parameters against
-the goal latent.
+By default this runs 40 rounds with 32 collected episodes, 100 dynamics steps,
+and 30 actor steps each. The trainer uses R3M `resnet18` by default. Each
+invocation writes to a timestamped directory under `runs/dynamics`, e.g.
+`runs/dynamics/20260515-142233/actor.pt`.
 
 Useful actor-video flags:
 
 ```bash
 uv run python train_dynamics.py \
   --actor-video-dataset-dir data/pickcube_expert_videos \
-  --actor-train-interval 250 \
-  --actor-train-steps 10 \
+  --actor-train-steps-per-round 30 \
   --actor-rollout-horizon 1 \
   --actor-pair-min-gap 1 \
-  --actor-pair-max-gap 1
+  --actor-pair-max-gap 1 \
+  --actor-pairs-per-video 8
 ```
+
+`--actor-pairs-per-video` controls how many (start, goal) pairs are drawn from
+each loaded video before moving to the next — higher values reduce MP4 decode
+and cache pressure during actor training.
 
 Disable actor-video training:
 
@@ -70,10 +85,11 @@ Disable actor-video training:
 uv run python train_dynamics.py --no-actor-video-training
 ```
 
-Change checkpoint frequency:
+R3M precision (frozen backbone, so lossless to drop precision; ~2× faster on
+CUDA):
 
 ```bash
-uv run python train_dynamics.py --checkpoint-interval 500
+uv run python train_dynamics.py --backbone-precision bf16
 ```
 
 For a quick smoke run:
@@ -87,9 +103,7 @@ uv run python train_dynamics.py \
   --max-steps 25 \
   --train-steps-per-round 25 \
   --batch-size 32 \
-  --checkpoint-interval 25 \
-  --actor-train-interval 25 \
-  --actor-train-steps 1
+  --actor-train-steps-per-round 5
 ```
 
 View logs:
@@ -101,7 +115,7 @@ uv run tensorboard --logdir runs
 TensorBoard groups:
 
 - `dynamics/*`: forward dynamics train/eval losses and gradient norm.
-- `actor/*`: video-goal actor loss, goal cosine, policy std, and gradient norm.
+- `actor/*`: video-goal actor loss, goal cosine, policy std, frame gap, and gradient norm.
 - `rollout/*`: environment rollout returns, success, episode length, and sampled policy action scale.
 - `replay_buffer/*`: replay buffer size.
 - `progress/*`: coarse run progress markers.
@@ -112,7 +126,7 @@ Build an image-only dataset from official PickCube expert trajectories:
 
 ```bash
 uv run python build_pickcube_video_dataset.py \
-  --max-episodes 10 \
+  --max-episodes 50 \
   --output-dir data/pickcube_expert_videos
 ```
 
