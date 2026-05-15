@@ -1,0 +1,35 @@
+type: task
+name: mpc-control-smoke
+
+image: maniskill/base
+
+files:
+  - .:/workflow
+
+working_dir: /workflow
+
+env:
+  - PYTHONUNBUFFERED=1
+  - MS_SKIP_ASSET_DOWNLOAD_PROMPT=1
+  # Set this only when a future training entrypoint logs to W&B:
+  #   uv run dstack secret set wandb_api_key '<your-key>'
+  - WANDB_API_KEY
+
+resources:
+  gpu: A5000
+
+max_duration: 2h
+
+commands:
+  - pip install -q uv
+  - uv sync --frozen
+  # Replace this smoke rollout with the TD-MPC2 trainer once it exists.
+  - >
+    uv run python demo.py
+    --render-mode none
+    --render-backend none
+    --sim-backend physx_cuda
+    --obs-mode state
+    --policy random
+    --episodes 2
+    --max-steps 50

@@ -1,0 +1,35 @@
+# Anything dstack should NOT upload to the remote worker.
+
+# Python / venv
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Local state
+.dstack/
+.git/
+
+# Training artifacts
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+wandb/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

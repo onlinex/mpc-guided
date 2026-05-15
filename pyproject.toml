@@ -1,7 +1,35 @@
 [project]
-name = "mpc-guided"
+name = "mpc-control"
 version = "0.1.0"
-description = "Add your description here"
+description = "TD-MPC2 experiments on ManiSkill"
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "gymnasium>=1.0.0",
+    "mani-skill>=3.0.1",
+    "numpy>=1.26.0",
+    "r3m",
+    "tensorboard>=2.20.0",
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "wandb>=0.19.0",
+]
+
+[tool.uv.sources]
+r3m = { git = "https://github.com/facebookresearch/r3m.git" }
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "dstack[all]>=0.20.19",
+]

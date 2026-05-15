@@ -1,5 +1,5 @@
 def main():
-    print("Hello from mpc-guided!")
+    print("Hello from mpc-control!")
 
 
 if __name__ == "__main__":
