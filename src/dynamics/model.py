@@ -19,7 +19,7 @@ class ForwardDynamicsConfig:
     hidden_dims: tuple[int, ...] = (512, 512)
     activation: str = "silu"
     layer_norm: bool = True
-    dropout: float = 0.0
+    dropout: float = 0.1
     predict_delta: bool = True
 
 

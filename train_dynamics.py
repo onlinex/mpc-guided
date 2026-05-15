@@ -61,10 +61,10 @@ class TrainDynamicsConfig:
     episodes_per_round: int = 32
     max_steps: int = 100
     buffer_capacity: int = 50_000
-    train_steps_per_round: int = 100
+    train_steps_per_round: int = 50
     batch_size: int = 128
-    lr: float = 3e-4
-    weight_decay: float = 1e-3
+    lr: float = 1e-4
+    weight_decay: float = 3e-3
     grad_clip_norm: float | None = 10.0
     hidden_dims: tuple[int, ...] = (512, 512)
     log_dir: str = "runs/dynamics"
