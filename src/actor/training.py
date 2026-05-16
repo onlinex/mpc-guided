@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.actor.stochastic import StochasticActor
+from src.actor.model import Actor
 from src.backbone import encode_images
 from src.datasets.video_pairs import VideoFramePairSampler
 from src.dynamics.model import ForwardDynamicsModel
@@ -27,7 +27,7 @@ class VideoActorTrainer:
     def __init__(
         self,
         *,
-        actor: StochasticActor,
+        actor: Actor,
         dynamics: ForwardDynamicsModel,
         backbone: torch.nn.Module,
         sampler: VideoFramePairSampler,
@@ -60,7 +60,7 @@ class VideoActorTrainer:
             goal_state = encode_images(self.backbone, batch.goal_rgb, self.device)
 
         gaps = batch.frame_gaps.to(self.device).long()
-        pred_state, action_abs_mean, actor_std_mean = self._rollout(start_state, gaps)
+        pred_state, action_abs_mean = self._rollout(start_state, gaps)
         loss = F.mse_loss(pred_state, goal_state)
         cosine = F.cosine_similarity(pred_state, goal_state, dim=-1).mean()
 
@@ -72,7 +72,6 @@ class VideoActorTrainer:
             "loss": float(loss.detach().cpu()),
             "cosine": float(cosine.detach().cpu()),
             "action_abs_mean": action_abs_mean,
-            "actor_std_mean": actor_std_mean,
             "frame_gap_mean": float(batch.frame_gaps.mean().detach().cpu()),
             "grad_norm": grad_norm,
         }
@@ -81,7 +80,7 @@ class VideoActorTrainer:
         self,
         start_state: torch.Tensor,
         gaps: torch.Tensor,
-    ) -> tuple[torch.Tensor, float, float]:
+    ) -> tuple[torch.Tensor, float]:
         dynamics_requires_grad = [p.requires_grad for p in self.dynamics.parameters()]
         for p in self.dynamics.parameters():
             p.requires_grad_(False)
@@ -89,19 +88,17 @@ class VideoActorTrainer:
             max_gap = int(gaps.max().item())
             state = start_state
             states = [state]
-            action_abs_means, actor_std_means = [], []
+            action_abs_means = []
             for _ in range(max_gap):
-                sample = self.actor.sample(state, deterministic=True)
-                action_abs_means.append(sample.action.detach().abs().mean())
-                actor_std_means.append(sample.std.detach().mean())
-                state = self.dynamics(state, sample.action)
+                action = self.actor(state)
+                action_abs_means.append(action.detach().abs().mean())
+                state = self.dynamics(state, action)
                 states.append(state)
             trajectory = torch.stack(states, dim=1)  # (B, max_gap+1, D)
             gather_idx = gaps.view(-1, 1, 1).expand(-1, 1, trajectory.shape[-1])
             pred_state = trajectory.gather(1, gather_idx).squeeze(1)
             action_abs_mean = float(torch.stack(action_abs_means).mean().cpu())
-            actor_std_mean = float(torch.stack(actor_std_means).mean().cpu())
-            return pred_state, action_abs_mean, actor_std_mean
+            return pred_state, action_abs_mean
         finally:
             for p, requires_grad in zip(self.dynamics.parameters(), dynamics_requires_grad, strict=True):
                 p.requires_grad_(requires_grad)

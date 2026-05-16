@@ -17,8 +17,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.actor import (
-    StochasticActor,
-    StochasticActorConfig,
+    Actor,
+    ActorConfig,
     VideoActorTrainer,
     VideoActorTrainerConfig,
 )
@@ -236,7 +236,7 @@ def sanitize_run_name(name: str) -> str:
 def collect_actor_episodes(
     *,
     env: gym.Env,
-    actor: StochasticActor,
+    actor: Actor,
     buffer: TransitionReplayBuffer,
     backbone: torch.nn.Module,
     device: torch.device,
@@ -327,7 +327,7 @@ def collect_actor_episodes(
 def train_round(
     *,
     trainer: DynamicsTrainer,
-    actor: StochasticActor,
+    actor: Actor,
     actor_video_trainer: VideoActorTrainer | None,
     buffer: TransitionReplayBuffer,
     cfg: TrainDynamicsConfig,
@@ -455,7 +455,7 @@ def _train_actor_phase(
 def save_checkpoint(
     *,
     run_dir: Path,
-    actor: StochasticActor,
+    actor: Actor,
     cfg: TrainDynamicsConfig,
     train_step: int,
     actor_train_step: int,
@@ -479,14 +479,13 @@ def save_checkpoint(
 
 @torch.no_grad()
 def deterministic_actor_action(
-    actor: StochasticActor,
+    actor: Actor,
     state: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
     actor.eval()
     state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).reshape(1, -1)
-    sample = actor.sample(state_tensor, deterministic=True)
-    return sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return actor(state_tensor).squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
 def encode_observation(
@@ -554,7 +553,7 @@ def to_rgb_uint8(rgb: np.ndarray) -> np.ndarray:
 def build_actor_video_trainer(
     *,
     cfg: TrainDynamicsConfig,
-    actor: StochasticActor,
+    actor: Actor,
     dynamics: ForwardDynamicsModel,
     backbone: torch.nn.Module,
     device: torch.device,
@@ -625,8 +624,8 @@ def run(cfg: TrainDynamicsConfig) -> None:
             action_dim=action_dim,
             seed=cfg.seed,
         )
-        actor = StochasticActor(
-            StochasticActorConfig(action_dim=action_dim, state_dim=R3M_FEAT_DIM),
+        actor = Actor(
+            ActorConfig(action_dim=action_dim, state_dim=R3M_FEAT_DIM),
             action_low=torch.as_tensor(action_space.low, dtype=torch.float32),
             action_high=torch.as_tensor(action_space.high, dtype=torch.float32),
         ).to(device)

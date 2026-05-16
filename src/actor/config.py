@@ -1,15 +1,13 @@
-"""Configuration and value types for actor modules."""
+"""Configuration types for the actor."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
-
 
 @dataclass(frozen=True)
-class StochasticActorConfig:
-    """Configuration for a squashed Gaussian actor over bounded actions."""
+class ActorConfig:
+    """Configuration for a deterministic actor over bounded actions."""
 
     action_dim: int
     state_dim: int = 512
@@ -17,16 +15,3 @@ class StochasticActorConfig:
     activation: str = "silu"
     layer_norm: bool = True
     dropout: float = 0.0
-    log_std_min: float = -5.0
-    log_std_max: float = -1.0
-
-
-@dataclass(frozen=True)
-class ActorSample:
-    """A sampled bounded action and diagnostics from the actor distribution."""
-
-    action: torch.Tensor
-    mean: torch.Tensor
-    std: torch.Tensor
-    raw_mean: torch.Tensor
-    log_std: torch.Tensor

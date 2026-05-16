@@ -1,13 +1,12 @@
 """Actor modules and public actor interfaces."""
 
-from src.actor.config import ActorSample, StochasticActorConfig
-from src.actor.stochastic import StochasticActor
+from src.actor.config import ActorConfig
+from src.actor.model import Actor
 from src.actor.training import VideoActorTrainer, VideoActorTrainerConfig
 
 __all__ = [
-    "ActorSample",
-    "StochasticActor",
-    "StochasticActorConfig",
+    "Actor",
+    "ActorConfig",
     "VideoActorTrainer",
     "VideoActorTrainerConfig",
 ]

@@ -10,7 +10,7 @@ import mani_skill.envs  # noqa: F401
 import numpy as np
 import torch
 
-from src.actor import StochasticActor, StochasticActorConfig
+from src.actor import Actor, ActorConfig
 from src.backbone import build_backbone, encode_images
 from src.rollout import rollout
 from src.utils import OUNoise, pick_device
@@ -77,18 +77,18 @@ class SpaceActor:
 
 
 class CheckpointActor:
-    """Wraps a trained ``StochasticActor`` plus an R3M backbone for env rollouts.
+    """Wraps a trained ``Actor`` plus an R3M backbone for env rollouts.
 
-    Always queries the actor in deterministic mean mode. When ``ou_noise`` is
-    provided (non-deterministic demo mode), AR(1) exploration noise is added to
-    the mean action and clipped to the action bounds — matching how training
-    collection drives the env.
+    The actor is always queried deterministically. When ``ou_noise`` is provided
+    (``--stochastic`` mode), AR(1) exploration noise is added to the action and
+    clipped to the action bounds — matching how training collection drives the
+    env.
     """
 
     def __init__(
         self,
         *,
-        actor: StochasticActor,
+        actor: Actor,
         backbone: torch.nn.Module,
         device: torch.device,
         camera_uid: str,
@@ -117,8 +117,7 @@ class CheckpointActor:
         if rgb_tensor.ndim == 3:
             rgb_tensor = rgb_tensor.unsqueeze(0)
         state = encode_images(self.backbone, rgb_tensor, self.device)
-        sample = self.actor.sample(state, deterministic=True)
-        action = sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        action = self.actor(state).squeeze(0).detach().cpu().numpy().astype(np.float32)
         if self.ou_noise is not None:
             action = np.clip(
                 action + self.ou_noise.sample(), self.action_low, self.action_high
@@ -150,12 +149,12 @@ def load_actor_from_checkpoint(
     path: str,
     *,
     device: torch.device,
-) -> StochasticActor:
+) -> Actor:
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    actor_config = StochasticActorConfig(**ckpt["actor_config"])
+    actor_config = ActorConfig(**ckpt["actor_config"])
     action_low = ckpt["action_low"]
     action_high = ckpt["action_high"]
-    actor = StochasticActor(
+    actor = Actor(
         actor_config,
         action_low=action_low,
         action_high=action_high,
