@@ -208,12 +208,6 @@ def make_env(cfg: TrainDynamicsConfig) -> gym.Env:
     return gym.make(cfg.env_id, **kwargs)
 
 
-def select_device(name: str) -> torch.device:
-    if name == "auto":
-        return pick_device()
-    return torch.device(name)
-
-
 def create_run_dir(root: str, run_name: str | None) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dirname = timestamp
@@ -465,8 +459,6 @@ def save_checkpoint(
         {
             "actor_state_dict": actor.state_dict(),
             "actor_config": asdict(actor.config),
-            "action_low": actor.action_low.detach().cpu(),
-            "action_high": actor.action_high.detach().cpu(),
             "train_config": asdict(cfg),
             "train_step": train_step,
             "actor_train_step": actor_train_step,
@@ -522,7 +514,7 @@ def build_actor_video_trainer(
 
 
 def run(cfg: TrainDynamicsConfig) -> None:
-    device = select_device(cfg.device)
+    device = pick_device(cfg.device)
     run_dir = create_run_dir(cfg.log_dir, cfg.run_name)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)

@@ -1,7 +1,7 @@
 [project]
 name = "mpc-control"
 version = "0.1.0"
-description = "TD-MPC2 experiments on ManiSkill"
+description = "Goal-state behavior cloning with learned visual dynamics on ManiSkill"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

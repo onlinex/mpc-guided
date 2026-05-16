@@ -130,14 +130,15 @@ def load_actor_from_checkpoint(
 ) -> Actor:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     actor_config = ActorConfig(**ckpt["actor_config"])
-    action_low = ckpt["action_low"]
-    action_high = ckpt["action_high"]
+    state_dict = ckpt["actor_state_dict"]
+    placeholder_action_low = torch.full((actor_config.action_dim,), -1.0, dtype=torch.float32)
+    placeholder_action_high = torch.full((actor_config.action_dim,), 1.0, dtype=torch.float32)
     actor = Actor(
         actor_config,
-        action_low=action_low,
-        action_high=action_high,
+        action_low=placeholder_action_low,
+        action_high=placeholder_action_high,
     ).to(device)
-    actor.load_state_dict(ckpt["actor_state_dict"])
+    actor.load_state_dict(state_dict)
     actor.eval()
     return actor
 
@@ -227,7 +228,7 @@ def run(cfg: DemoConfig) -> None:
         if not isinstance(action_space, gym.spaces.Box):
             raise TypeError(f"Expected Box action space, got {type(action_space).__name__}.")
         if cfg.checkpoint is not None:
-            device = pick_device() if cfg.device == "auto" else torch.device(cfg.device)
+            device = pick_device(cfg.device)
             backbone = build_backbone(device, model_id=cfg.r3m_model_id)
             loaded_actor = load_actor_from_checkpoint(cfg.checkpoint, device=device)
             action_dim = int(np.prod(action_space.shape))

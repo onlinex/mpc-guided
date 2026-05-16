@@ -1,6 +1,6 @@
 # mpc-control
 
-TD-MPC2 experiments on ManiSkill.
+Goal-state behavior cloning with learned visual dynamics on ManiSkill.
 
 This repository is set up with the shared ManiSkill infrastructure from
 `ra-control`, without the SAC / FPO / METRA / RPO algorithm packages.
