@@ -13,7 +13,7 @@ import torch
 from src.actor import StochasticActor, StochasticActorConfig
 from src.backbone import build_backbone, encode_images
 from src.rollout import rollout
-from src.utils import pick_device
+from src.utils import OUNoise, pick_device
 
 
 ENV_ID = "PickCube-v1"
@@ -37,7 +37,9 @@ class DemoConfig:
     checkpoint: str | None = None
     r3m_model_id: str = "resnet18"
     device: str = "auto"
-    deterministic: bool = True
+    stochastic: bool = False
+    exploration_ou_theta: float = 0.15
+    exploration_ou_std: float = 0.5
 
 
 class SpaceActor:
@@ -75,7 +77,13 @@ class SpaceActor:
 
 
 class CheckpointActor:
-    """Wraps a trained ``StochasticActor`` plus an R3M backbone for env rollouts."""
+    """Wraps a trained ``StochasticActor`` plus an R3M backbone for env rollouts.
+
+    Always queries the actor in deterministic mean mode. When ``ou_noise`` is
+    provided (non-deterministic demo mode), AR(1) exploration noise is added to
+    the mean action and clipped to the action bounds — matching how training
+    collection drives the env.
+    """
 
     def __init__(
         self,
@@ -85,17 +93,22 @@ class CheckpointActor:
         device: torch.device,
         camera_uid: str,
         action_chunk_size: int,
-        deterministic: bool,
+        ou_noise: OUNoise | None,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
     ) -> None:
         self.actor = actor
         self.backbone = backbone
         self.device = device
         self.camera_uid = camera_uid
         self.action_chunk_size = action_chunk_size
-        self.deterministic = deterministic
+        self.ou_noise = ou_noise
+        self.action_low = action_low
+        self.action_high = action_high
 
     def reset(self) -> None:
-        pass
+        if self.ou_noise is not None:
+            self.ou_noise.reset()
 
     @torch.no_grad()
     def __call__(self, obs) -> np.ndarray:
@@ -104,8 +117,12 @@ class CheckpointActor:
         if rgb_tensor.ndim == 3:
             rgb_tensor = rgb_tensor.unsqueeze(0)
         state = encode_images(self.backbone, rgb_tensor, self.device)
-        sample = self.actor.sample(state, deterministic=self.deterministic)
+        sample = self.actor.sample(state, deterministic=True)
         action = sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        if self.ou_noise is not None:
+            action = np.clip(
+                action + self.ou_noise.sample(), self.action_low, self.action_high
+            ).astype(np.float32)
         return np.repeat(action.reshape(1, -1), self.action_chunk_size, axis=0)
 
 
@@ -172,10 +189,22 @@ def parse_args() -> DemoConfig:
     p.add_argument("--r3m-model-id", default=defaults.r3m_model_id)
     p.add_argument("--device", default=defaults.device)
     p.add_argument(
-        "--deterministic",
-        action=argparse.BooleanOptionalAction,
-        default=defaults.deterministic,
-        help="Use the actor's mean action instead of sampling.",
+        "--stochastic",
+        action="store_true",
+        default=defaults.stochastic,
+        help="Add OU exploration noise on top of the actor's mean action. Default is deterministic.",
+    )
+    p.add_argument(
+        "--exploration-ou-theta",
+        type=float,
+        default=defaults.exploration_ou_theta,
+        help="AR(1)/OU decorrelation rate for --stochastic playback.",
+    )
+    p.add_argument(
+        "--exploration-ou-std",
+        type=float,
+        default=defaults.exploration_ou_std,
+        help="Stationary std of the AR(1) exploration noise for --stochastic playback.",
     )
     args = p.parse_args()
     if args.episodes < 1:
@@ -224,15 +253,30 @@ def run(cfg: DemoConfig) -> None:
             device = pick_device() if cfg.device == "auto" else torch.device(cfg.device)
             backbone = build_backbone(device, model_id=cfg.r3m_model_id)
             loaded_actor = load_actor_from_checkpoint(cfg.checkpoint, device=device)
+            action_dim = int(np.prod(action_space.shape))
+            ou_noise = (
+                None
+                if not cfg.stochastic or cfg.exploration_ou_std <= 0.0
+                else OUNoise(
+                    action_dim=action_dim,
+                    theta=cfg.exploration_ou_theta,
+                    stationary_std=cfg.exploration_ou_std,
+                    seed=cfg.seed,
+                )
+            )
             actor = CheckpointActor(
                 actor=loaded_actor,
                 backbone=backbone,
                 device=device,
                 camera_uid="base_camera",
                 action_chunk_size=cfg.action_chunk_size,
-                deterministic=cfg.deterministic,
+                ou_noise=ou_noise,
+                action_low=np.asarray(action_space.low, dtype=np.float32).reshape(-1),
+                action_high=np.asarray(action_space.high, dtype=np.float32).reshape(-1),
             )
             policy_label = f"checkpoint:{cfg.checkpoint}"
+            if ou_noise is not None:
+                policy_label += f" (OU theta={cfg.exploration_ou_theta} std={cfg.exploration_ou_std})"
         else:
             actor = SpaceActor(
                 action_space,

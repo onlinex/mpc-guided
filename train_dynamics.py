@@ -37,7 +37,7 @@ from src.dynamics import (
     ForwardDynamicsModel,
     TransitionReplayBuffer,
 )
-from src.utils import pick_device, to_scalar_bool
+from src.utils import OUNoise, pick_device, to_scalar_bool
 
 
 ENV_ID = "PickCube-v1"
@@ -81,6 +81,8 @@ class TrainDynamicsConfig:
     actor_lr: float = 3e-4
     actor_weight_decay: float = 1e-3
     actor_grad_clip_norm: float | None = 10.0
+    exploration_ou_theta: float = 0.15
+    exploration_ou_std: float = 0.5
     device: str = "auto"
 
 
@@ -141,6 +143,18 @@ def parse_args() -> TrainDynamicsConfig:
     p.add_argument("--actor-lr", type=float, default=defaults.actor_lr)
     p.add_argument("--actor-weight-decay", type=float, default=defaults.actor_weight_decay)
     p.add_argument("--actor-grad-clip-norm", type=float, default=defaults.actor_grad_clip_norm)
+    p.add_argument(
+        "--exploration-ou-theta",
+        type=float,
+        default=defaults.exploration_ou_theta,
+        help="Decorrelation rate for AR(1)/OU exploration noise. Smaller = more committed.",
+    )
+    p.add_argument(
+        "--exploration-ou-std",
+        type=float,
+        default=defaults.exploration_ou_std,
+        help="Stationary std of the AR(1) exploration noise added during env collection. 0 disables.",
+    )
     p.add_argument("--device", default=defaults.device)
     args = p.parse_args()
 
@@ -231,6 +245,9 @@ def collect_actor_episodes(
     global_episode: int,
     global_step: int,
     phase: str,
+    ou_noise: OUNoise | None,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
 ) -> tuple[int, int]:
     progress = tqdm(
         range(cfg.episodes_per_round),
@@ -242,11 +259,19 @@ def collect_actor_episodes(
     for _ in progress:
         obs, _ = env.reset(seed=cfg.seed + global_episode)
         state = encode_observation(backbone, obs, device, cfg.camera_uid)
+        if ou_noise is not None:
+            ou_noise.reset()
         ep_return, succeeded = 0.0, False
-        action_abs_sum, actor_std_sum = 0.0, 0.0
+        action_abs_sum, noise_abs_sum = 0.0, 0.0
         episode_actions: list[np.ndarray] = []
         for ep_step in range(cfg.max_steps):
-            action, actor_std = sample_actor_action(actor, state, device)
+            mean_action = deterministic_actor_action(actor, state, device)
+            if ou_noise is not None:
+                noise = ou_noise.sample()
+                action = np.clip(mean_action + noise, action_low, action_high).astype(np.float32)
+                noise_abs_sum += float(np.abs(noise).mean())
+            else:
+                action = mean_action
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_state = encode_observation(backbone, next_obs, device, cfg.camera_uid)
             buffer.add(state, action, next_state)
@@ -254,7 +279,6 @@ def collect_actor_episodes(
             episode_actions.append(action)
             ep_return += float(np.asarray(reward).reshape(-1)[0])
             action_abs_sum += float(np.abs(action).mean())
-            actor_std_sum += actor_std
             succeeded = succeeded or to_scalar_bool(info.get("success", False))
             state = next_state
             global_step += 1
@@ -277,8 +301,8 @@ def collect_actor_episodes(
             global_episode,
         )
         writer.add_scalar(
-            "rollout/policy_std_mean",
-            actor_std_sum / (ep_step + 1),
+            "rollout/exploration_noise_abs_mean",
+            noise_abs_sum / (ep_step + 1) if ou_noise is not None else 0.0,
             global_episode,
         )
         writer.add_scalar(
@@ -294,7 +318,7 @@ def collect_actor_episodes(
             success=int(succeeded),
             buffer=len(buffer),
             action=f"{action_abs_sum / (ep_step + 1):.2f}",
-            std=f"{actor_std_sum / (ep_step + 1):.2f}",
+            noise=f"{(noise_abs_sum / (ep_step + 1)) if ou_noise is not None else 0.0:.2f}",
         )
         global_episode += 1
     return global_episode, global_step
@@ -454,16 +478,15 @@ def save_checkpoint(
 
 
 @torch.no_grad()
-def sample_actor_action(
+def deterministic_actor_action(
     actor: StochasticActor,
     state: np.ndarray,
     device: torch.device,
-) -> tuple[np.ndarray, float]:
+) -> np.ndarray:
     actor.eval()
     state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).reshape(1, -1)
-    sample = actor.sample(state_tensor)
-    action = sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
-    return action, float(sample.std.mean().detach().cpu())
+    sample = actor.sample(state_tensor, deterministic=True)
+    return sample.action.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
 def encode_observation(
@@ -607,6 +630,18 @@ def run(cfg: TrainDynamicsConfig) -> None:
             action_low=torch.as_tensor(action_space.low, dtype=torch.float32),
             action_high=torch.as_tensor(action_space.high, dtype=torch.float32),
         ).to(device)
+        ou_noise = (
+            OUNoise(
+                action_dim=action_dim,
+                theta=cfg.exploration_ou_theta,
+                stationary_std=cfg.exploration_ou_std,
+                seed=cfg.seed,
+            )
+            if cfg.exploration_ou_std > 0.0
+            else None
+        )
+        action_low_np = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+        action_high_np = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
         actor_video_trainer = build_actor_video_trainer(
             cfg=cfg,
             actor=actor,
@@ -651,6 +686,9 @@ def run(cfg: TrainDynamicsConfig) -> None:
             global_episode=global_episode,
             global_step=global_step,
             phase="initial_collect",
+            ou_noise=ou_noise,
+            action_low=action_low_np,
+            action_high=action_high_np,
         )
 
         for round_idx in range(cfg.collection_rounds):
@@ -681,6 +719,9 @@ def run(cfg: TrainDynamicsConfig) -> None:
                 global_episode=global_episode,
                 global_step=global_step,
                 phase=f"collect_round_{round_idx}",
+                ou_noise=ou_noise,
+                action_low=action_low_np,
+                action_high=action_high_np,
             )
 
         checkpoint_path = save_checkpoint(
