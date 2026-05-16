@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 import re
-from typing import Any
 
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
@@ -27,9 +26,9 @@ from src.backbone import (
     R3M_FEAT_DIM,
     R3M_MODEL_IDS,
     build_backbone,
-    encode_images,
 )
 from src.datasets.video_pairs import VideoFramePairSampler
+from src.observations import encode_observation
 from src.dynamics import (
     DynamicsTrainer,
     DynamicsTrainerConfig,
@@ -82,7 +81,7 @@ class TrainDynamicsConfig:
     actor_weight_decay: float = 1e-3
     actor_grad_clip_norm: float | None = 10.0
     exploration_ou_theta: float = 0.15
-    exploration_ou_std: float = 0.5
+    exploration_ou_std: float = 0.6
     device: str = "auto"
 
 
@@ -486,68 +485,6 @@ def deterministic_actor_action(
     actor.eval()
     state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).reshape(1, -1)
     return actor(state_tensor).squeeze(0).detach().cpu().numpy().astype(np.float32)
-
-
-def encode_observation(
-    backbone: torch.nn.Module,
-    obs: Any,
-    device: torch.device,
-    camera_uid: str | None,
-) -> np.ndarray:
-    rgb = extract_rgb(obs, camera_uid)
-    rgb = np.asarray(rgb)
-    if rgb.ndim == 3:
-        rgb = rgb[None]
-    if rgb.ndim != 4:
-        raise ValueError(f"expected RGB image with rank 3 or 4, got shape {rgb.shape}")
-    if rgb.shape[-1] > 3:
-        rgb = rgb[..., :3]
-    if rgb.shape[-1] != 3:
-        raise ValueError(f"expected RGB image last dim to be 3, got shape {rgb.shape}")
-
-    rgb_tensor = torch.as_tensor(to_rgb_uint8(rgb))
-    features = encode_images(backbone, rgb_tensor, device)
-    return features[0].detach().cpu().numpy().astype(np.float32)
-
-
-def extract_rgb(obs: Any, camera_uid: str | None) -> np.ndarray:
-    if camera_uid is not None:
-        try:
-            rgb = obs["sensor_data"][camera_uid]["rgb"]
-        except KeyError as exc:
-            raise KeyError(f"camera_uid={camera_uid!r} not found in observation") from exc
-        return tensor_to_numpy(rgb)
-
-    found = find_rgb(obs)
-    if found is None:
-        raise KeyError("could not find an 'rgb' image in the ManiSkill observation")
-    return tensor_to_numpy(found)
-
-
-def find_rgb(value: Any) -> Any | None:
-    if isinstance(value, dict):
-        if "rgb" in value:
-            return value["rgb"]
-        for child in value.values():
-            found = find_rgb(child)
-            if found is not None:
-                return found
-    return None
-
-
-def tensor_to_numpy(value: Any) -> np.ndarray:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().numpy()
-    return np.asarray(value)
-
-
-def to_rgb_uint8(rgb: np.ndarray) -> np.ndarray:
-    if rgb.dtype == np.uint8:
-        return rgb
-    rgb_float = rgb.astype(np.float32)
-    if rgb_float.size > 0 and rgb_float.max() <= 1.0:
-        rgb_float = rgb_float * 255.0
-    return np.clip(rgb_float, 0.0, 255.0).astype(np.uint8)
 
 
 def build_actor_video_trainer(

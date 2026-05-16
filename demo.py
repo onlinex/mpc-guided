@@ -11,7 +11,8 @@ import numpy as np
 import torch
 
 from src.actor import Actor, ActorConfig
-from src.backbone import build_backbone, encode_images
+from src.backbone import build_backbone
+from src.observations import encode_observation
 from src.rollout import rollout
 from src.utils import OUNoise, pick_device
 
@@ -112,37 +113,14 @@ class CheckpointActor:
 
     @torch.no_grad()
     def __call__(self, obs) -> np.ndarray:
-        rgb = _extract_rgb(obs, self.camera_uid)
-        rgb_tensor = torch.as_tensor(_to_rgb_uint8(rgb))
-        if rgb_tensor.ndim == 3:
-            rgb_tensor = rgb_tensor.unsqueeze(0)
-        state = encode_images(self.backbone, rgb_tensor, self.device)
+        state_np = encode_observation(self.backbone, obs, self.device, self.camera_uid)
+        state = torch.as_tensor(state_np, device=self.device).reshape(1, -1)
         action = self.actor(state).squeeze(0).detach().cpu().numpy().astype(np.float32)
         if self.ou_noise is not None:
             action = np.clip(
                 action + self.ou_noise.sample(), self.action_low, self.action_high
             ).astype(np.float32)
         return np.repeat(action.reshape(1, -1), self.action_chunk_size, axis=0)
-
-
-def _extract_rgb(obs, camera_uid: str) -> np.ndarray:
-    rgb = obs["sensor_data"][camera_uid]["rgb"]
-    if isinstance(rgb, torch.Tensor):
-        rgb = rgb.detach().cpu().numpy()
-    return np.asarray(rgb)
-
-
-def _to_rgb_uint8(rgb: np.ndarray) -> np.ndarray:
-    if rgb.ndim == 4:
-        rgb = rgb[..., :3]
-    elif rgb.ndim == 3:
-        rgb = rgb[..., :3]
-    if rgb.dtype == np.uint8:
-        return rgb
-    rgb_float = rgb.astype(np.float32)
-    if rgb_float.size > 0 and rgb_float.max() <= 1.0:
-        rgb_float = rgb_float * 255.0
-    return np.clip(rgb_float, 0.0, 255.0).astype(np.uint8)
 
 
 def load_actor_from_checkpoint(

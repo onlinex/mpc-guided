@@ -12,10 +12,11 @@ import h5py
 import imageio.v3 as iio
 import mani_skill.envs  # noqa: F401
 import numpy as np
-import torch
 from mani_skill.trajectory import utils as trajectory_utils
 from mani_skill.utils import io_utils
 from tqdm import tqdm
+
+from src.observations import extract_rgb
 
 
 DEFAULT_PICKCUBE_TRAJECTORY = (
@@ -170,32 +171,6 @@ def build_episode_record(
         camera_uid=cfg.camera_uid,
         source_trajectory=str(trajectory_path),
     )
-
-
-def extract_rgb(obs: Any, camera_uid: str) -> np.ndarray:
-    try:
-        rgb = obs["sensor_data"][camera_uid]["rgb"]
-    except KeyError as exc:
-        raise KeyError(f"camera_uid={camera_uid!r} not found in observation") from exc
-    if isinstance(rgb, torch.Tensor):
-        rgb = rgb.detach().cpu().numpy()
-    rgb = np.asarray(rgb)
-    if rgb.ndim == 4:
-        if rgb.shape[0] != 1:
-            raise ValueError(f"expected single-env RGB batch, got shape {rgb.shape}")
-        rgb = rgb[0]
-    if rgb.ndim != 3:
-        raise ValueError(f"expected RGB image rank 3, got shape {rgb.shape}")
-    if rgb.shape[-1] > 3:
-        rgb = rgb[..., :3]
-    if rgb.shape[-1] != 3:
-        raise ValueError(f"expected RGB last dimension 3, got shape {rgb.shape}")
-    if rgb.dtype == np.uint8:
-        return rgb
-    rgb_float = rgb.astype(np.float32)
-    if rgb_float.size > 0 and rgb_float.max() <= 1.0:
-        rgb_float *= 255.0
-    return np.clip(rgb_float, 0.0, 255.0).astype(np.uint8)
 
 
 def write_dataset_metadata(
