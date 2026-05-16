@@ -81,7 +81,7 @@ class TrainDynamicsConfig:
     actor_weight_decay: float = 1e-3
     actor_grad_clip_norm: float | None = 10.0
     exploration_ou_theta: float = 0.15
-    exploration_ou_std: float = 0.6
+    exploration_ou_std: float = 0.5
     device: str = "auto"
 
 
