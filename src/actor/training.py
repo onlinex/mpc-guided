@@ -22,7 +22,13 @@ class VideoActorTrainerConfig:
 
 
 class VideoActorTrainer:
-    """Optimizes an actor to reach goal R3M latents through learned dynamics."""
+    """Optimizes an actor to reach goal visual latents through learned dynamics.
+
+    Rolls the actor forward through frozen dynamics for ``gap`` steps and
+    matches only the visual (R3M) component of the predicted state against the
+    R3M encoding of the goal frame. Proprio is propagated through the rollout
+    but is not part of the loss — goals are visual frames, not full robot states.
+    """
 
     def __init__(
         self,
@@ -56,13 +62,14 @@ class VideoActorTrainer:
 
         batch = self.sampler.sample(self.config.batch_size, self.device)
         with torch.no_grad():
-            start_state = encode_images(self.backbone, batch.start_rgb, self.device)
-            goal_state = encode_images(self.backbone, batch.goal_rgb, self.device)
+            start_visual = encode_images(self.backbone, batch.start_rgb, self.device)
+            goal_visual = encode_images(self.backbone, batch.goal_rgb, self.device)
+        start_proprio = batch.start_proprio.to(self.device)
 
         gaps = batch.frame_gaps.to(self.device).long()
-        pred_state, action_abs_mean = self._rollout(start_state, gaps)
-        loss = F.mse_loss(pred_state, goal_state)
-        cosine = F.cosine_similarity(pred_state, goal_state, dim=-1).mean()
+        pred_visual, action_abs_mean = self._rollout(start_visual, start_proprio, gaps)
+        loss = F.mse_loss(pred_visual, goal_visual)
+        cosine = F.cosine_similarity(pred_visual, goal_visual, dim=-1).mean()
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -78,7 +85,8 @@ class VideoActorTrainer:
 
     def _rollout(
         self,
-        start_state: torch.Tensor,
+        start_visual: torch.Tensor,
+        start_proprio: torch.Tensor,
         gaps: torch.Tensor,
     ) -> tuple[torch.Tensor, float]:
         dynamics_requires_grad = [p.requires_grad for p in self.dynamics.parameters()]
@@ -86,19 +94,19 @@ class VideoActorTrainer:
             p.requires_grad_(False)
         try:
             max_gap = int(gaps.max().item())
-            state = start_state
-            states = [state]
+            visual, proprio = start_visual, start_proprio
+            visuals = [visual]
             action_abs_means = []
             for _ in range(max_gap):
-                action = self.actor(state)
+                action = self.actor(visual, proprio)
                 action_abs_means.append(action.detach().abs().mean())
-                state = self.dynamics(state, action)
-                states.append(state)
-            trajectory = torch.stack(states, dim=1)  # (B, max_gap+1, D)
+                visual, proprio = self.dynamics(visual, proprio, action)
+                visuals.append(visual)
+            trajectory = torch.stack(visuals, dim=1)  # (B, max_gap+1, visual_dim)
             gather_idx = gaps.view(-1, 1, 1).expand(-1, 1, trajectory.shape[-1])
-            pred_state = trajectory.gather(1, gather_idx).squeeze(1)
+            pred_visual = trajectory.gather(1, gather_idx).squeeze(1)
             action_abs_mean = float(torch.stack(action_abs_means).mean().cpu())
-            return pred_state, action_abs_mean
+            return pred_visual, action_abs_mean
         finally:
             for p, requires_grad in zip(self.dynamics.parameters(), dynamics_requires_grad, strict=True):
                 p.requires_grad_(requires_grad)

@@ -17,6 +17,11 @@ def parse_args() -> ExpertVideoDatasetConfig:
     p.add_argument("--trajectory-path", default=DEFAULT_PICKCUBE_TRAJECTORY)
     p.add_argument("--output-dir", default=defaults.output_dir)
     p.add_argument("--env-id", default=defaults.env_id)
+    p.add_argument(
+        "--control-mode",
+        default=defaults.control_mode,
+        help="Replay control mode. Default pd_joint_delta_pos matches the actor's action space.",
+    )
     p.add_argument("--sim-backend", default=defaults.sim_backend)
     p.add_argument("--render-backend", default=defaults.render_backend)
     p.add_argument("--camera-uid", default=defaults.camera_uid)
@@ -26,6 +31,12 @@ def parse_args() -> ExpertVideoDatasetConfig:
     p.add_argument("--frame-stride", type=int, default=defaults.frame_stride)
     p.add_argument("--fps", type=int, default=defaults.fps)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument(
+        "--save-actions",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.save_actions,
+        help="Save per-episode derived pd_joint_delta_pos actions (.npy) for dynamics pretraining.",
+    )
     args = p.parse_args()
     if args.width < 1:
         p.error("--width must be >= 1")

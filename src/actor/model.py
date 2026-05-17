@@ -1,4 +1,4 @@
-"""Deterministic state-conditioned policy."""
+"""Deterministic policy with separated visual + proprio inputs."""
 
 from __future__ import annotations
 
@@ -10,11 +10,12 @@ from src.networks import MLP
 
 
 class Actor(nn.Module):
-    """Deterministic policy mapping states to bounded actions.
+    """Deterministic policy mapping ``(visual, proprio)`` to bounded actions.
 
-    The MLP predicts pre-tanh action means; outputs are squashed through tanh
-    and linearly scaled into the env's action bounds. Exploration noise (e.g.
-    AR(1)/OU) is applied externally by the env-collection loop.
+    The two input streams are concatenated internally to drive a single MLP
+    whose pre-tanh output is squashed and linearly scaled into the env's
+    action bounds. Exploration noise (e.g. AR(1)/OU) is applied externally
+    by the env-collection loop.
     """
 
     def __init__(
@@ -27,8 +28,10 @@ class Actor(nn.Module):
         super().__init__()
         if config.action_dim < 1:
             raise ValueError(f"action_dim must be >= 1, got {config.action_dim}")
-        if config.state_dim < 1:
-            raise ValueError(f"state_dim must be >= 1, got {config.state_dim}")
+        if config.visual_dim < 1:
+            raise ValueError(f"visual_dim must be >= 1, got {config.visual_dim}")
+        if config.proprio_dim < 0:
+            raise ValueError(f"proprio_dim must be >= 0, got {config.proprio_dim}")
         action_low = action_low.to(dtype=torch.float32).reshape(-1)
         action_high = action_high.to(dtype=torch.float32).reshape(-1)
         if action_low.shape != (config.action_dim,):
@@ -46,7 +49,7 @@ class Actor(nn.Module):
 
         self.config = config
         self.net = MLP(
-            config.state_dim,
+            config.visual_dim + config.proprio_dim,
             config.action_dim,
             config.hidden_dims,
             activation_name=config.activation,
@@ -59,19 +62,34 @@ class Actor(nn.Module):
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
 
     @property
-    def state_dim(self) -> int:
-        return self.config.state_dim
+    def visual_dim(self) -> int:
+        return self.config.visual_dim
+
+    @property
+    def proprio_dim(self) -> int:
+        return self.config.proprio_dim
 
     @property
     def action_dim(self) -> int:
         return self.config.action_dim
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        if state.ndim != 2:
-            raise ValueError(f"state must be rank-2 (B, state_dim), got shape {tuple(state.shape)}")
-        if state.shape[1] != self.state_dim:
-            raise ValueError(f"state dim must be {self.state_dim}, got {state.shape[1]}")
-        raw = self.net(state)
+    def forward(self, visual: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
+        for name, tensor, expected in (
+            ("visual", visual, self.visual_dim),
+            ("proprio", proprio, self.proprio_dim),
+        ):
+            if tensor.ndim != 2:
+                raise ValueError(
+                    f"{name} must be rank-2 (B, {expected}), got shape {tuple(tensor.shape)}"
+                )
+            if tensor.shape[1] != expected:
+                raise ValueError(f"{name} dim must be {expected}, got {tensor.shape[1]}")
+        if visual.shape[0] != proprio.shape[0]:
+            raise ValueError(
+                f"visual and proprio batch sizes differ: {visual.shape[0]} vs {proprio.shape[0]}"
+            )
+        x = torch.cat([visual, proprio], dim=-1)
+        raw = self.net(x)
         squashed = torch.tanh(raw)
         action = squashed * self.action_scale + self.action_bias
         return action.clamp(self.action_low, self.action_high)

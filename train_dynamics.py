@@ -27,8 +27,12 @@ from src.backbone import (
     R3M_MODEL_IDS,
     build_backbone,
 )
+from src.datasets.expert_transitions import (
+    count_expert_transitions,
+    seed_buffer_with_expert,
+)
 from src.datasets.video_pairs import VideoFramePairSampler
-from src.observations import encode_observation
+from src.observations import encode_observation, extract_proprio, proprio_dim_of
 from src.dynamics import (
     DynamicsTrainer,
     DynamicsTrainerConfig,
@@ -65,7 +69,7 @@ class TrainDynamicsConfig:
     lr: float = 1e-4
     weight_decay: float = 3e-3
     grad_clip_norm: float | None = 10.0
-    hidden_dims: tuple[int, ...] = (512, 512)
+    hidden_dims: tuple[int, ...] = (1024, 1024)
     log_dir: str = "runs/dynamics"
     run_name: str | None = None
     log_interval: int = 50
@@ -82,6 +86,11 @@ class TrainDynamicsConfig:
     actor_grad_clip_norm: float | None = 10.0
     exploration_ou_theta: float = 0.15
     exploration_ou_std: float = 0.5
+    proprio_loss_weight: float | None = None  # None -> auto = proprio_dim / visual_dim
+    seed_buffer_with_expert: bool = True
+    pin_expert_in_buffer: bool = True
+    pretrain_dynamics_steps: int = 1000
+    pretrain_batch_size: int = 128
     device: str = "auto"
 
 
@@ -107,7 +116,12 @@ def parse_args() -> TrainDynamicsConfig:
     p.add_argument("--collection-rounds", type=int, default=defaults.collection_rounds)
     p.add_argument("--episodes-per-round", type=int, default=defaults.episodes_per_round)
     p.add_argument("--max-steps", type=int, default=defaults.max_steps)
-    p.add_argument("--buffer-capacity", type=int, default=defaults.buffer_capacity)
+    p.add_argument(
+        "--buffer-capacity",
+        type=int,
+        default=defaults.buffer_capacity,
+        help="On-policy slots in the replay buffer. Pinned expert transitions are added on top.",
+    )
     p.add_argument("--train-steps-per-round", type=int, default=defaults.train_steps_per_round)
     p.add_argument("--batch-size", type=int, default=defaults.batch_size)
     p.add_argument("--lr", type=float, default=defaults.lr)
@@ -154,6 +168,32 @@ def parse_args() -> TrainDynamicsConfig:
         default=defaults.exploration_ou_std,
         help="Stationary std of the AR(1) exploration noise added during env collection. 0 disables.",
     )
+    p.add_argument(
+        "--proprio-loss-weight",
+        type=float,
+        default=defaults.proprio_loss_weight,
+        help="Weight on the proprio MSE in dynamics loss. Default auto = proprio_dim/visual_dim, "
+        "which reproduces the scale of a single concat-state MSE.",
+    )
+    p.add_argument(
+        "--pretrain-dynamics-steps",
+        type=int,
+        default=defaults.pretrain_dynamics_steps,
+        help="Dynamics gradient steps on expert (rgb_t, action_t, rgb_{t+1}) before main loop. 0 disables.",
+    )
+    p.add_argument("--pretrain-batch-size", type=int, default=defaults.pretrain_batch_size)
+    p.add_argument(
+        "--seed-buffer-with-expert",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.seed_buffer_with_expert,
+        help="Encode every expert (rgb_t, action_t, rgb_{t+1}) transition into the replay buffer at startup.",
+    )
+    p.add_argument(
+        "--pin-expert-in-buffer",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.pin_expert_in_buffer,
+        help="Mark expert transitions as never-evictable so they keep complementing on-policy data.",
+    )
     p.add_argument("--device", default=defaults.device)
     args = p.parse_args()
 
@@ -179,6 +219,10 @@ def parse_args() -> TrainDynamicsConfig:
             p.error(f"--{field.replace('_', '-')} must be >= 1")
     if args.actor_train_steps_per_round < 0:
         p.error("--actor-train-steps-per-round must be >= 0")
+    if args.pretrain_dynamics_steps < 0:
+        p.error("--pretrain-dynamics-steps must be >= 0")
+    if args.pretrain_batch_size < 1:
+        p.error("--pretrain-batch-size must be >= 1")
     if args.actor_pair_max_gap < args.actor_pair_min_gap:
         p.error("--actor-pair-max-gap must be >= --actor-pair-min-gap")
     return TrainDynamicsConfig(
@@ -251,14 +295,15 @@ def collect_actor_episodes(
     )
     for _ in progress:
         obs, _ = env.reset(seed=cfg.seed + global_episode)
-        state = encode_observation(backbone, obs, device, cfg.camera_uid)
+        visual = encode_observation(backbone, obs, device, cfg.camera_uid)
+        proprio = extract_proprio(env)
         if ou_noise is not None:
             ou_noise.reset()
         ep_return, succeeded = 0.0, False
         action_abs_sum, noise_abs_sum = 0.0, 0.0
         episode_actions: list[np.ndarray] = []
         for ep_step in range(cfg.max_steps):
-            mean_action = deterministic_actor_action(actor, state, device)
+            mean_action = deterministic_actor_action(actor, visual, proprio, device)
             if ou_noise is not None:
                 noise = ou_noise.sample()
                 action = np.clip(mean_action + noise, action_low, action_high).astype(np.float32)
@@ -266,14 +311,15 @@ def collect_actor_episodes(
             else:
                 action = mean_action
             next_obs, reward, terminated, truncated, info = env.step(action)
-            next_state = encode_observation(backbone, next_obs, device, cfg.camera_uid)
-            buffer.add(state, action, next_state)
+            next_visual = encode_observation(backbone, next_obs, device, cfg.camera_uid)
+            next_proprio = extract_proprio(env)
+            buffer.add(visual, proprio, action, next_visual, next_proprio)
 
             episode_actions.append(action)
             ep_return += float(np.asarray(reward).reshape(-1)[0])
             action_abs_sum += float(np.abs(action).mean())
             succeeded = succeeded or to_scalar_bool(info.get("success", False))
-            state = next_state
+            visual, proprio = next_visual, next_proprio
             global_step += 1
 
             done = to_scalar_bool(terminated) or to_scalar_bool(truncated)
@@ -357,7 +403,9 @@ def train_round(
     )
     tqdm.write(
         f"round_{round_idx} done: dyn_step={train_step} "
-        f"loss={last_dyn_metrics['loss']:.6f} delta={last_dyn_metrics['delta_loss']:.6f} "
+        f"loss={last_dyn_metrics['loss']:.6f} "
+        f"visual={last_dyn_metrics['visual_loss']:.6f} "
+        f"proprio={last_dyn_metrics['proprio_loss']:.6f} "
         f"actor_step={actor_train_step} | checkpoint: {checkpoint_path}"
     )
     return train_step, actor_train_step
@@ -380,33 +428,48 @@ def _train_dynamics_phase(
         dynamic_ncols=True,
         leave=True,
     )
-    metrics: dict[str, float] = {"loss": float("nan"), "delta_loss": float("nan"), "grad_norm": float("nan")}
+    metrics: dict[str, float] = {
+        "loss": float("nan"),
+        "visual_loss": float("nan"),
+        "proprio_loss": float("nan"),
+        "grad_norm": float("nan"),
+    }
     for _ in progress:
         batch = buffer.sample(cfg.batch_size, device)
         metrics = trainer.train_step(batch)
         next_train_step = train_step + 1
         writer.add_scalar("dynamics/train_loss", metrics["loss"], train_step)
+        writer.add_scalar("dynamics/visual_loss", metrics["visual_loss"], train_step)
+        writer.add_scalar("dynamics/proprio_loss", metrics["proprio_loss"], train_step)
         writer.add_scalar("dynamics/grad_norm", metrics["grad_norm"], train_step)
         if train_step % 50 == 0:
             eval_metrics = trainer.eval_step(buffer.sample(cfg.batch_size, device))
             writer.add_scalar("dynamics/eval_loss", eval_metrics["loss"], train_step)
-            writer.add_scalar("dynamics/eval_cosine", eval_metrics["cosine"], train_step)
+            writer.add_scalar("dynamics/eval_visual_loss", eval_metrics["visual_loss"], train_step)
+            writer.add_scalar("dynamics/eval_proprio_loss", eval_metrics["proprio_loss"], train_step)
+            writer.add_scalar("dynamics/eval_visual_cosine", eval_metrics["visual_cosine"], train_step)
             writer.add_scalar(
-                "dynamics/identity_loss_ratio",
-                eval_metrics["identity_loss_ratio"],
+                "dynamics/visual_identity_loss_ratio",
+                eval_metrics["visual_identity_loss_ratio"],
+                train_step,
+            )
+            writer.add_scalar(
+                "dynamics/proprio_identity_loss_ratio",
+                eval_metrics["proprio_identity_loss_ratio"],
                 train_step,
             )
         progress.set_postfix(
             step=next_train_step,
             loss=f"{metrics['loss']:.4f}",
-            delta=f"{metrics['delta_loss']:.4f}",
+            vis=f"{metrics['visual_loss']:.4f}",
+            pro=f"{metrics['proprio_loss']:.4f}",
             buffer=len(buffer),
         )
         if next_train_step % cfg.log_interval == 0:
             tqdm.write(
                 f"dynamics step={next_train_step} round={round_idx} "
-                f"loss={metrics['loss']:.6f} delta={metrics['delta_loss']:.6f} "
-                f"grad={metrics['grad_norm']:.3f}"
+                f"loss={metrics['loss']:.6f} visual={metrics['visual_loss']:.6f} "
+                f"proprio={metrics['proprio_loss']:.6f} grad={metrics['grad_norm']:.3f}"
             )
         train_step = next_train_step
     return train_step, metrics
@@ -471,12 +534,103 @@ def save_checkpoint(
 @torch.no_grad()
 def deterministic_actor_action(
     actor: Actor,
-    state: np.ndarray,
+    visual: np.ndarray,
+    proprio: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
     actor.eval()
-    state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).reshape(1, -1)
-    return actor(state_tensor).squeeze(0).detach().cpu().numpy().astype(np.float32)
+    visual_t = torch.as_tensor(visual, dtype=torch.float32, device=device).reshape(1, -1)
+    proprio_t = torch.as_tensor(proprio, dtype=torch.float32, device=device).reshape(1, -1)
+    return actor(visual_t, proprio_t).squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+
+def _resolve_buffer_capacity(cfg: TrainDynamicsConfig) -> int:
+    """Total buffer capacity = on-policy slots (``buffer_capacity``) + pinned expert."""
+    if not cfg.seed_buffer_with_expert:
+        return cfg.buffer_capacity
+    expert = count_expert_transitions(cfg.actor_video_dataset_dir)
+    total = cfg.buffer_capacity + expert
+    tqdm.write(
+        f"Buffer capacity: {cfg.buffer_capacity} on-policy slots + {expert} pinned expert "
+        f"= {total} total"
+    )
+    return total
+
+
+def seed_and_pretrain(
+    *,
+    trainer: DynamicsTrainer,
+    buffer: TransitionReplayBuffer,
+    cfg: TrainDynamicsConfig,
+    backbone: torch.nn.Module,
+    device: torch.device,
+    writer: SummaryWriter,
+) -> None:
+    if not cfg.seed_buffer_with_expert and cfg.pretrain_dynamics_steps == 0:
+        return
+    if cfg.seed_buffer_with_expert:
+        tqdm.write(
+            f"Seeding replay buffer with expert transitions from {cfg.actor_video_dataset_dir}"
+        )
+        added = seed_buffer_with_expert(
+            buffer=buffer,
+            dataset_dir=cfg.actor_video_dataset_dir,
+            backbone=backbone,
+            device=device,
+        )
+        if cfg.pin_expert_in_buffer:
+            buffer.pin_current_contents()
+        tqdm.write(
+            f"Seeded {added} expert transitions "
+            f"(buffer size={len(buffer)}, pinned={buffer.pinned})"
+        )
+        writer.add_scalar("replay_buffer/expert_seeded", added, 0)
+        writer.add_scalar("replay_buffer/pinned", buffer.pinned, 0)
+
+    if cfg.pretrain_dynamics_steps == 0:
+        return
+    if len(buffer) == 0:
+        tqdm.write("Skipping pretrain: replay buffer is empty (enable --seed-buffer-with-expert).")
+        return
+    tqdm.write(
+        f"Pretraining dynamics on seeded buffer: "
+        f"{cfg.pretrain_dynamics_steps} steps x batch {cfg.pretrain_batch_size}"
+    )
+    progress = tqdm(
+        range(cfg.pretrain_dynamics_steps),
+        desc="pretrain/dynamics",
+        unit="step",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for step in progress:
+        batch = buffer.sample(cfg.pretrain_batch_size, device)
+        metrics = trainer.train_step(batch)
+        writer.add_scalar("pretrain/dynamics_loss", metrics["loss"], step)
+        writer.add_scalar("pretrain/dynamics_visual_loss", metrics["visual_loss"], step)
+        writer.add_scalar("pretrain/dynamics_proprio_loss", metrics["proprio_loss"], step)
+        writer.add_scalar("pretrain/dynamics_grad_norm", metrics["grad_norm"], step)
+        if step % 50 == 0:
+            eval_metrics = trainer.eval_step(buffer.sample(cfg.pretrain_batch_size, device))
+            writer.add_scalar("pretrain/dynamics_eval_loss", eval_metrics["loss"], step)
+            writer.add_scalar(
+                "pretrain/dynamics_eval_visual_cosine", eval_metrics["visual_cosine"], step
+            )
+            writer.add_scalar(
+                "pretrain/dynamics_visual_identity_loss_ratio",
+                eval_metrics["visual_identity_loss_ratio"],
+                step,
+            )
+            writer.add_scalar(
+                "pretrain/dynamics_proprio_identity_loss_ratio",
+                eval_metrics["proprio_identity_loss_ratio"],
+                step,
+            )
+        progress.set_postfix(
+            loss=f"{metrics['loss']:.4f}",
+            vis=f"{metrics['visual_loss']:.4f}",
+            pro=f"{metrics['proprio_loss']:.4f}",
+        )
 
 
 def build_actor_video_trainer(
@@ -526,6 +680,7 @@ def run(cfg: TrainDynamicsConfig) -> None:
         if not isinstance(action_space, gym.spaces.Box):
             raise TypeError(f"Expected Box action space, got {type(action_space).__name__}")
         action_dim = int(np.prod(action_space.shape))
+        proprio_dim = proprio_dim_of(env)
 
         backbone = build_backbone(
             device,
@@ -535,26 +690,39 @@ def run(cfg: TrainDynamicsConfig) -> None:
         model = ForwardDynamicsModel(
             ForwardDynamicsConfig(
                 action_dim=action_dim,
-                state_dim=R3M_FEAT_DIM,
+                visual_dim=R3M_FEAT_DIM,
+                proprio_dim=proprio_dim,
                 hidden_dims=cfg.hidden_dims,
             )
         ).to(device)
+        # Match the old concat-MSE behavior: a single mean over (visual_dim + proprio_dim)
+        # elements weighted proprio by proprio_dim / (visual_dim + proprio_dim). Splitting
+        # into two per-stream means and weighting proprio at this ratio reproduces it,
+        # so the visual head keeps the same effective gradient share as before.
+        if cfg.proprio_loss_weight is None:
+            proprio_loss_weight = proprio_dim / R3M_FEAT_DIM if proprio_dim > 0 else 0.0
+        else:
+            proprio_loss_weight = float(cfg.proprio_loss_weight)
+        tqdm.write(f"Dynamics proprio_loss_weight={proprio_loss_weight:.4f}")
         trainer = DynamicsTrainer(
             model,
             DynamicsTrainerConfig(
                 lr=cfg.lr,
                 weight_decay=cfg.weight_decay,
                 grad_clip_norm=cfg.grad_clip_norm,
+                proprio_loss_weight=proprio_loss_weight,
             ),
         )
+        effective_capacity = _resolve_buffer_capacity(cfg)
         buffer = TransitionReplayBuffer(
-            cfg.buffer_capacity,
-            state_dim=R3M_FEAT_DIM,
+            effective_capacity,
+            visual_dim=R3M_FEAT_DIM,
+            proprio_dim=proprio_dim,
             action_dim=action_dim,
             seed=cfg.seed,
         )
         actor = Actor(
-            ActorConfig(action_dim=action_dim, state_dim=R3M_FEAT_DIM),
+            ActorConfig(action_dim=action_dim, visual_dim=R3M_FEAT_DIM, proprio_dim=proprio_dim),
             action_low=torch.as_tensor(action_space.low, dtype=torch.float32),
             action_high=torch.as_tensor(action_space.high, dtype=torch.float32),
         ).to(device)
@@ -582,7 +750,10 @@ def run(cfg: TrainDynamicsConfig) -> None:
         writer.add_text("model", repr(model), 0)
         writer.add_text("actor", repr(actor), 0)
         tqdm.write(f"Logging TensorBoard events to {run_dir}")
-        tqdm.write(f"Device: {device} | action_dim={action_dim} | state_dim={R3M_FEAT_DIM}")
+        tqdm.write(
+            f"Device: {device} | action_dim={action_dim} | "
+            f"visual_dim={R3M_FEAT_DIM} proprio_dim={proprio_dim}"
+        )
         tqdm.write(
             f"Plan: collect {cfg.initial_episodes} initial episodes, then run "
             f"{cfg.collection_rounds} rounds x {cfg.train_steps_per_round} train steps "
@@ -597,6 +768,16 @@ def run(cfg: TrainDynamicsConfig) -> None:
             )
 
         global_episode, global_step, train_step, actor_train_step = 0, 0, 0, 0
+
+        seed_and_pretrain(
+            trainer=trainer,
+            buffer=buffer,
+            cfg=cfg,
+            backbone=backbone,
+            device=device,
+            writer=writer,
+        )
+
         initial_cfg = TrainDynamicsConfig(
             **{
                 **cfg.__dict__,

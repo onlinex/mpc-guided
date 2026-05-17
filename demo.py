@@ -12,7 +12,7 @@ import torch
 
 from src.actor import Actor, ActorConfig
 from src.backbone import build_backbone
-from src.observations import encode_observation
+from src.observations import encode_observation, extract_proprio
 from src.rollout import rollout
 from src.utils import OUNoise, pick_device
 
@@ -91,6 +91,7 @@ class CheckpointActor:
         *,
         actor: Actor,
         backbone: torch.nn.Module,
+        env: gym.Env,
         device: torch.device,
         camera_uid: str,
         action_chunk_size: int,
@@ -100,6 +101,7 @@ class CheckpointActor:
     ) -> None:
         self.actor = actor
         self.backbone = backbone
+        self.env = env
         self.device = device
         self.camera_uid = camera_uid
         self.action_chunk_size = action_chunk_size
@@ -113,9 +115,11 @@ class CheckpointActor:
 
     @torch.no_grad()
     def __call__(self, obs) -> np.ndarray:
-        state_np = encode_observation(self.backbone, obs, self.device, self.camera_uid)
-        state = torch.as_tensor(state_np, device=self.device).reshape(1, -1)
-        action = self.actor(state).squeeze(0).detach().cpu().numpy().astype(np.float32)
+        visual_np = encode_observation(self.backbone, obs, self.device, self.camera_uid)
+        proprio_np = extract_proprio(self.env)
+        visual = torch.as_tensor(visual_np, device=self.device).reshape(1, -1)
+        proprio = torch.as_tensor(proprio_np, device=self.device).reshape(1, -1)
+        action = self.actor(visual, proprio).squeeze(0).detach().cpu().numpy().astype(np.float32)
         if self.ou_noise is not None:
             action = np.clip(
                 action + self.ou_noise.sample(), self.action_low, self.action_high
@@ -245,6 +249,7 @@ def run(cfg: DemoConfig) -> None:
             actor = CheckpointActor(
                 actor=loaded_actor,
                 backbone=backbone,
+                env=env,
                 device=device,
                 camera_uid="base_camera",
                 action_chunk_size=cfg.action_chunk_size,

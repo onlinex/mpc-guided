@@ -4,11 +4,34 @@ from __future__ import annotations
 
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 
 from src.backbone import encode_images
+
+
+def extract_proprio(env: gym.Env) -> np.ndarray:
+    """Return ``concat(qpos, qvel)`` of the active robot as a 1-D float32 array.
+
+    Provides the velocity/momentum signal that a single RGB frame cannot carry,
+    so dynamics doesn't have to average over a hidden velocity distribution.
+    """
+    robot = env.unwrapped.agent.robot
+    qpos = _to_np_1d(robot.get_qpos())
+    qvel = _to_np_1d(robot.get_qvel())
+    return np.concatenate([qpos, qvel]).astype(np.float32)
+
+
+def proprio_dim_of(env: gym.Env) -> int:
+    return int(extract_proprio(env).shape[0])
+
+
+def _to_np_1d(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float32).reshape(-1)
 
 
 def extract_rgb(obs: Any, camera_uid: str | None = None) -> np.ndarray:
