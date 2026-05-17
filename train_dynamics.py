@@ -85,11 +85,11 @@ class TrainDynamicsConfig:
     actor_weight_decay: float = 1e-3
     actor_grad_clip_norm: float | None = 10.0
     exploration_ou_theta: float = 0.15
-    exploration_ou_std: float = 0.5
+    exploration_ou_std: float = 0.0
     proprio_loss_weight: float | None = None  # None -> auto = proprio_dim / visual_dim
     seed_buffer_with_expert: bool = True
     pin_expert_in_buffer: bool = True
-    pretrain_dynamics_steps: int = 1000
+    pretrain_dynamics_steps: int = 10000
     pretrain_batch_size: int = 128
     device: str = "auto"
 
