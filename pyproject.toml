@@ -33,4 +33,14 @@ explicit = true
 [dependency-groups]
 dev = [
     "dstack[all]>=0.20.19",
+    "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "env: requires a live ManiSkill env (slow, several seconds per test)",
+    "dataset: requires the built expert video dataset on disk; auto-skipped otherwise",
+]
+addopts = "-ra --strict-markers"

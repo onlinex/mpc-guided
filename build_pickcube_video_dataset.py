@@ -1,4 +1,4 @@
-"""Create an image-only video dataset from PickCube expert trajectories."""
+"""Create the PickCube video+action+state dataset by replaying expert demos."""
 
 from __future__ import annotations
 
@@ -14,13 +14,19 @@ from src.datasets.expert_videos import (
 def parse_args() -> ExpertVideoDatasetConfig:
     defaults = ExpertVideoDatasetConfig()
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--trajectory-path", default=DEFAULT_PICKCUBE_TRAJECTORY)
+    p.add_argument(
+        "--trajectory-path",
+        default=DEFAULT_PICKCUBE_TRAJECTORY,
+        help="Source H5 — must already be in the target control_mode. Convert with "
+        "`mani_skill.trajectory.replay_trajectory --target-control-mode <mode> "
+        "--save-traj --use-env-states` if needed.",
+    )
     p.add_argument("--output-dir", default=defaults.output_dir)
     p.add_argument("--env-id", default=defaults.env_id)
     p.add_argument(
         "--control-mode",
         default=defaults.control_mode,
-        help="Replay control mode. Default pd_joint_delta_pos matches the actor's action space.",
+        help="Must match the source trajectory's control_mode (validated at build time).",
     )
     p.add_argument("--sim-backend", default=defaults.sim_backend)
     p.add_argument("--render-backend", default=defaults.render_backend)
@@ -28,22 +34,13 @@ def parse_args() -> ExpertVideoDatasetConfig:
     p.add_argument("--width", type=int, default=defaults.width)
     p.add_argument("--height", type=int, default=defaults.height)
     p.add_argument("--max-episodes", type=int, default=defaults.max_episodes)
-    p.add_argument("--frame-stride", type=int, default=defaults.frame_stride)
     p.add_argument("--fps", type=int, default=defaults.fps)
     p.add_argument("--overwrite", action="store_true")
-    p.add_argument(
-        "--save-actions",
-        action=argparse.BooleanOptionalAction,
-        default=defaults.save_actions,
-        help="Save per-episode derived pd_joint_delta_pos actions (.npy) for dynamics pretraining.",
-    )
     args = p.parse_args()
     if args.width < 1:
         p.error("--width must be >= 1")
     if args.height < 1:
         p.error("--height must be >= 1")
-    if args.frame_stride < 1:
-        p.error("--frame-stride must be >= 1")
     if args.max_episodes is not None and args.max_episodes < 1:
         p.error("--max-episodes must be >= 1 when set")
     if args.fps < 1:
@@ -54,7 +51,11 @@ def parse_args() -> ExpertVideoDatasetConfig:
 def main() -> None:
     records = build_expert_video_dataset(parse_args())
     frames = sum(record.num_frames for record in records)
-    print(f"Built expert video dataset: episodes={len(records)} frames={frames}", flush=True)
+    actions = sum(record.num_actions for record in records)
+    print(
+        f"Built expert video dataset: episodes={len(records)} frames={frames} actions={actions}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

@@ -32,7 +32,13 @@ from src.datasets.expert_transitions import (
     seed_buffer_with_expert,
 )
 from src.datasets.video_pairs import VideoFramePairSampler
-from src.observations import encode_observation, extract_proprio, proprio_dim_of
+from src.observations import (
+    encode_observation,
+    extract_privileged_state,
+    extract_proprio,
+    privileged_state_dim_of,
+    proprio_dim_of,
+)
 from src.dynamics import (
     DynamicsTrainer,
     DynamicsTrainerConfig,
@@ -91,6 +97,9 @@ class TrainDynamicsConfig:
     pin_expert_in_buffer: bool = True
     pretrain_dynamics_steps: int = 10000
     pretrain_batch_size: int = 128
+    use_privileged_state: bool = False
+    actor_bc_mode: bool = False
+    actor_bc_input_noise: float = 0.0
     device: str = "auto"
 
 
@@ -183,6 +192,28 @@ def parse_args() -> TrainDynamicsConfig:
     )
     p.add_argument("--pretrain-batch-size", type=int, default=defaults.pretrain_batch_size)
     p.add_argument(
+        "--actor-bc-input-noise",
+        type=float,
+        default=defaults.actor_bc_input_noise,
+        help="Gaussian noise std added to (state, proprio) inputs during BC training. "
+        "DART-style augmentation; small values (~0.01) help with closed-loop covariate shift.",
+    )
+    p.add_argument(
+        "--actor-bc-mode",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.actor_bc_mode,
+        help="Train the actor as direct BC on expert (state, proprio, action) tuples from "
+        "the replay buffer, bypassing the dynamics-rollout objective entirely.",
+    )
+    p.add_argument(
+        "--use-privileged-state",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.use_privileged_state,
+        help="Bypass R3M and feed the simulator's privileged state (agent+extra) as the "
+        "'visual' stream into dynamics/actor. Diagnostic mode to isolate visual-encoding "
+        "issues from dynamics-learning issues.",
+    )
+    p.add_argument(
         "--seed-buffer-with-expert",
         action=argparse.BooleanOptionalAction,
         default=defaults.seed_buffer_with_expert,
@@ -271,12 +302,24 @@ def sanitize_run_name(name: str) -> str:
     return cleaned
 
 
+def _visual_from_obs(
+    obs,
+    *,
+    backbone: torch.nn.Module | None,
+    device: torch.device,
+    camera_uid: str | None,
+) -> np.ndarray:
+    if backbone is None:
+        return extract_privileged_state(obs)
+    return encode_observation(backbone, obs, device, camera_uid)
+
+
 def collect_actor_episodes(
     *,
     env: gym.Env,
     actor: Actor,
     buffer: TransitionReplayBuffer,
-    backbone: torch.nn.Module,
+    backbone: torch.nn.Module | None,
     device: torch.device,
     cfg: TrainDynamicsConfig,
     writer: SummaryWriter,
@@ -296,7 +339,7 @@ def collect_actor_episodes(
     )
     for _ in progress:
         obs, _ = env.reset(seed=cfg.seed + global_episode)
-        visual = encode_observation(backbone, obs, device, cfg.camera_uid)
+        visual = _visual_from_obs(obs, backbone=backbone, device=device, camera_uid=cfg.camera_uid)
         proprio = extract_proprio(env)
         if ou_noise is not None:
             ou_noise.reset()
@@ -312,7 +355,9 @@ def collect_actor_episodes(
             else:
                 action = mean_action
             next_obs, reward, terminated, truncated, info = env.step(action)
-            next_visual = encode_observation(backbone, next_obs, device, cfg.camera_uid)
+            next_visual = _visual_from_obs(
+                next_obs, backbone=backbone, device=device, camera_uid=cfg.camera_uid
+            )
             next_proprio = extract_proprio(env)
             buffer.add(visual, proprio, action, next_visual, next_proprio)
 
@@ -389,7 +434,9 @@ def train_round(
     )
     actor_train_step = _train_actor_phase(
         actor_video_trainer=actor_video_trainer,
+        buffer=buffer,
         cfg=cfg,
+        device=device,
         writer=writer,
         actor_train_step=actor_train_step,
         round_idx=round_idx,
@@ -481,33 +528,57 @@ def _train_dynamics_phase(
 def _train_actor_phase(
     *,
     actor_video_trainer: VideoActorTrainer | None,
+    buffer: TransitionReplayBuffer,
     cfg: TrainDynamicsConfig,
+    device: torch.device,
     writer: SummaryWriter,
     actor_train_step: int,
     round_idx: int,
 ) -> int:
     if actor_video_trainer is None or cfg.actor_train_steps_per_round == 0:
         return actor_train_step
+    desc = f"actor-bc/round_{round_idx}" if cfg.actor_bc_mode else f"actor/round_{round_idx}"
     progress = tqdm(
         range(cfg.actor_train_steps_per_round),
-        desc=f"actor/round_{round_idx}",
+        desc=desc,
         unit="step",
         dynamic_ncols=True,
         leave=True,
     )
     for _ in progress:
-        actor_metrics = actor_video_trainer.train_step()
+        if cfg.actor_bc_mode:
+            batch = buffer.sample(cfg.actor_batch_size, device)
+            actor_metrics = actor_video_trainer.bc_train_step(batch)
+        else:
+            actor_metrics = actor_video_trainer.train_step()
         writer.add_scalar("actor/train_loss", actor_metrics["loss"], actor_train_step)
         writer.add_scalar("actor/goal_cosine", actor_metrics["cosine"], actor_train_step)
         writer.add_scalar("actor/frame_gap_mean", actor_metrics["frame_gap_mean"], actor_train_step)
         writer.add_scalar("actor/grad_norm", actor_metrics["grad_norm"], actor_train_step)
-        actor_train_step += 1
-        progress.set_postfix(
-            step=actor_train_step,
-            loss=f"{actor_metrics['loss']:.4f}",
-            cos=f"{actor_metrics['cosine']:.3f}",
-            gap=f"{actor_metrics['frame_gap_mean']:.1f}",
+        writer.add_scalar(
+            "actor/action_abs_mean", actor_metrics["action_abs_mean"], actor_train_step
         )
+        if cfg.actor_bc_mode:
+            writer.add_scalar(
+                "actor/action_label_abs_mean",
+                actor_metrics["action_label_abs_mean"],
+                actor_train_step,
+            )
+        actor_train_step += 1
+        if cfg.actor_bc_mode:
+            progress.set_postfix(
+                step=actor_train_step,
+                loss=f"{actor_metrics['loss']:.4f}",
+                pred=f"{actor_metrics['action_abs_mean']:.2f}",
+                lbl=f"{actor_metrics['action_label_abs_mean']:.2f}",
+            )
+        else:
+            progress.set_postfix(
+                step=actor_train_step,
+                loss=f"{actor_metrics['loss']:.4f}",
+                cos=f"{actor_metrics['cosine']:.3f}",
+                gap=f"{actor_metrics['frame_gap_mean']:.1f}",
+            )
     return actor_train_step
 
 
@@ -565,7 +636,7 @@ def seed_and_pretrain(
     trainer: DynamicsTrainer,
     buffer: TransitionReplayBuffer,
     cfg: TrainDynamicsConfig,
-    backbone: torch.nn.Module,
+    backbone: torch.nn.Module | None,
     device: torch.device,
     writer: SummaryWriter,
 ) -> None:
@@ -641,7 +712,7 @@ def build_actor_video_trainer(
     cfg: TrainDynamicsConfig,
     actor: Actor,
     dynamics: ForwardDynamicsModel,
-    backbone: torch.nn.Module,
+    backbone: torch.nn.Module | None,
     device: torch.device,
 ) -> VideoActorTrainer | None:
     if not cfg.actor_video_training:
@@ -665,6 +736,7 @@ def build_actor_video_trainer(
             weight_decay=cfg.actor_weight_decay,
             grad_clip_norm=cfg.actor_grad_clip_norm,
             batch_size=cfg.actor_batch_size,
+            bc_input_noise_std=cfg.actor_bc_input_noise,
         ),
         device=device,
     )
@@ -685,15 +757,24 @@ def run(cfg: TrainDynamicsConfig) -> None:
         action_dim = int(np.prod(action_space.shape))
         proprio_dim = proprio_dim_of(env)
 
-        backbone = build_backbone(
-            device,
-            model_id=cfg.r3m_model_id,
-            precision=cfg.backbone_precision,
-        )
+        if cfg.use_privileged_state:
+            backbone = None
+            visual_dim = privileged_state_dim_of(env)
+            tqdm.write(
+                f"Privileged-state mode: skipping R3M backbone, visual_dim={visual_dim} "
+                f"(simulator agent+extra)"
+            )
+        else:
+            backbone = build_backbone(
+                device,
+                model_id=cfg.r3m_model_id,
+                precision=cfg.backbone_precision,
+            )
+            visual_dim = R3M_FEAT_DIM
         model = ForwardDynamicsModel(
             ForwardDynamicsConfig(
                 action_dim=action_dim,
-                visual_dim=R3M_FEAT_DIM,
+                visual_dim=visual_dim,
                 proprio_dim=proprio_dim,
                 hidden_dims=cfg.hidden_dims,
             )
@@ -703,7 +784,7 @@ def run(cfg: TrainDynamicsConfig) -> None:
         # into two per-stream means and weighting proprio at this ratio reproduces it,
         # so the visual head keeps the same effective gradient share as before.
         if cfg.proprio_loss_weight is None:
-            proprio_loss_weight = proprio_dim / R3M_FEAT_DIM if proprio_dim > 0 else 0.0
+            proprio_loss_weight = proprio_dim / visual_dim if proprio_dim > 0 else 0.0
         else:
             proprio_loss_weight = float(cfg.proprio_loss_weight)
         tqdm.write(f"Dynamics proprio_loss_weight={proprio_loss_weight:.4f}")
@@ -719,13 +800,13 @@ def run(cfg: TrainDynamicsConfig) -> None:
         effective_capacity = _resolve_buffer_capacity(cfg)
         buffer = TransitionReplayBuffer(
             effective_capacity,
-            visual_dim=R3M_FEAT_DIM,
+            visual_dim=visual_dim,
             proprio_dim=proprio_dim,
             action_dim=action_dim,
             seed=cfg.seed,
         )
         actor = Actor(
-            ActorConfig(action_dim=action_dim, visual_dim=R3M_FEAT_DIM, proprio_dim=proprio_dim),
+            ActorConfig(action_dim=action_dim, visual_dim=visual_dim, proprio_dim=proprio_dim),
             action_low=torch.as_tensor(action_space.low, dtype=torch.float32),
             action_high=torch.as_tensor(action_space.high, dtype=torch.float32),
         ).to(device)
@@ -755,7 +836,7 @@ def run(cfg: TrainDynamicsConfig) -> None:
         tqdm.write(f"Logging TensorBoard events to {run_dir}")
         tqdm.write(
             f"Device: {device} | action_dim={action_dim} | "
-            f"visual_dim={R3M_FEAT_DIM} proprio_dim={proprio_dim}"
+            f"visual_dim={visual_dim} proprio_dim={proprio_dim}"
         )
         tqdm.write(
             f"Plan: collect {cfg.initial_episodes} initial episodes, then run "

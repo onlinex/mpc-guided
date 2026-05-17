@@ -34,6 +34,41 @@ def _to_np_1d(value: Any) -> np.ndarray:
     return np.asarray(value, dtype=np.float32).reshape(-1)
 
 
+def extract_privileged_state(obs: Any) -> np.ndarray:
+    """Flat ``agent + extra`` state vector from a ManiSkill obs dict.
+
+    Used to bypass the visual encoder for diagnostic dynamics experiments:
+    instead of R3M features the dynamics model sees the simulator's fully
+    observable state (robot + task extras like cube/goal pose).
+    Excludes ``sensor_data`` / ``sensor_param`` (images and camera params).
+    """
+    if not isinstance(obs, dict):
+        raise TypeError(f"expected obs dict, got {type(obs).__name__}")
+    parts: list[np.ndarray] = []
+    for key in ("agent", "extra"):
+        if key in obs:
+            _flatten_into(obs[key], parts)
+    if not parts:
+        raise ValueError("observation has no agent/extra fields to extract state from")
+    return np.concatenate(parts).astype(np.float32)
+
+
+def privileged_state_dim_of(env: gym.Env) -> int:
+    """Reset the env once and measure the flat privileged-state dimension."""
+    obs, _ = env.reset()
+    return int(extract_privileged_state(obs).shape[0])
+
+
+def _flatten_into(value: Any, out: list[np.ndarray]) -> None:
+    if isinstance(value, dict):
+        for key in sorted(value.keys()):
+            _flatten_into(value[key], out)
+        return
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    out.append(np.asarray(value, dtype=np.float32).reshape(-1))
+
+
 def extract_rgb(obs: Any, camera_uid: str | None = None) -> np.ndarray:
     """Return a single ``(H, W, 3)`` uint8 RGB frame from a ManiSkill observation.
 

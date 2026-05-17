@@ -14,12 +14,20 @@ import torch
 
 @dataclass(frozen=True)
 class VideoPairBatch:
-    """A batch of start and goal RGB frames plus start-frame proprioception."""
+    """A batch of start and goal RGB frames plus start-frame proprioception.
+
+    ``start_state`` / ``goal_state`` are populated when the manifest references
+    per-frame privileged-state arrays — empty tensors otherwise. These are used
+    by the actor trainer when running with a privileged-state dynamics model
+    (i.e. when the R3M backbone is bypassed).
+    """
 
     start_rgb: torch.Tensor
     goal_rgb: torch.Tensor
     frame_gaps: torch.Tensor
     start_proprio: torch.Tensor  # (B, proprio_dim) float32
+    start_state: torch.Tensor  # (B, state_dim) float32 — empty when unavailable
+    goal_state: torch.Tensor  # (B, state_dim) float32 — empty when unavailable
 
 
 @dataclass(frozen=True)
@@ -27,6 +35,7 @@ class VideoRecord:
     video_path: Path
     num_frames: int
     proprio_path: Path | None
+    state_path: Path | None
 
 
 class VideoFramePairSampler:
@@ -66,17 +75,22 @@ class VideoFramePairSampler:
         self.rng = np.random.default_rng(seed)
         self._cache: OrderedDict[Path, np.ndarray] = OrderedDict()
         self._proprio_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
+        self._state_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
+        self.has_state = all(record.state_path is not None for record in self.records)
 
     def sample(self, batch_size: int, device: torch.device) -> VideoPairBatch:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
         starts, goals, gaps, start_proprios = [], [], [], []
+        start_states: list[np.ndarray] = []
+        goal_states: list[np.ndarray] = []
         remaining = batch_size
         while remaining > 0:
             record = self.records[int(self.rng.integers(0, len(self.records)))]
             video = self._load_video(record.video_path)
             proprio = self._load_proprio(record.proprio_path)  # type: ignore[arg-type]
+            state = self._load_state(record.state_path) if self.has_state else None
             num_pairs = min(self.pairs_per_video, remaining)
             for _ in range(num_pairs):
                 start_idx, goal_idx = self._sample_indices(len(video))
@@ -84,8 +98,12 @@ class VideoFramePairSampler:
                 goals.append(video[goal_idx])
                 gaps.append(goal_idx - start_idx)
                 start_proprios.append(proprio[start_idx])
+                if state is not None:
+                    start_states.append(state[start_idx])
+                    goal_states.append(state[goal_idx])
             remaining -= num_pairs
 
+        empty = torch.empty((0, 0), dtype=torch.float32, device=device)
         return VideoPairBatch(
             start_rgb=torch.as_tensor(np.stack(starts), dtype=torch.uint8, device=device),
             goal_rgb=torch.as_tensor(np.stack(goals), dtype=torch.uint8, device=device),
@@ -93,7 +111,30 @@ class VideoFramePairSampler:
             start_proprio=torch.as_tensor(
                 np.stack(start_proprios), dtype=torch.float32, device=device
             ),
+            start_state=(
+                torch.as_tensor(np.stack(start_states), dtype=torch.float32, device=device)
+                if start_states
+                else empty
+            ),
+            goal_state=(
+                torch.as_tensor(np.stack(goal_states), dtype=torch.float32, device=device)
+                if goal_states
+                else empty
+            ),
         )
+
+    def _load_state(self, path: Path) -> np.ndarray:
+        if path in self._state_cache:
+            arr = self._state_cache.pop(path)
+            self._state_cache[path] = arr
+            return arr
+        arr = np.asarray(np.load(path), dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(f"expected state shape (T, D), got {arr.shape} for {path}")
+        self._state_cache[path] = arr
+        while len(self._state_cache) > self.cache_size:
+            self._state_cache.popitem(last=False)
+        return arr
 
     def _load_proprio(self, path: Path) -> np.ndarray:
         if path in self._proprio_cache:
@@ -163,11 +204,19 @@ def load_video_records(dataset_dir: Path) -> list[VideoRecord]:
                 proprio_path = p if (p.is_absolute() or p.exists()) else dataset_dir / p
                 if not proprio_path.exists():
                     raise FileNotFoundError(f"proprio listed in manifest does not exist: {proprio_path}")
+            state_str = item.get("state_path")
+            state_path: Path | None = None
+            if state_str:
+                p = Path(state_str)
+                state_path = p if (p.is_absolute() or p.exists()) else dataset_dir / p
+                if not state_path.exists():
+                    raise FileNotFoundError(f"state listed in manifest does not exist: {state_path}")
             records.append(
                 VideoRecord(
                     video_path=video_path,
                     num_frames=int(item["num_frames"]),
                     proprio_path=proprio_path,
+                    state_path=state_path,
                 )
             )
     if not records:

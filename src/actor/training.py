@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from src.actor.model import Actor
 from src.backbone import encode_images
 from src.datasets.video_pairs import VideoFramePairSampler
+from src.dynamics.buffer import DynamicsBatch
 from src.dynamics.model import ForwardDynamicsModel
 
 
@@ -19,6 +20,7 @@ class VideoActorTrainerConfig:
     weight_decay: float = 1e-4
     grad_clip_norm: float | None = 10.0
     batch_size: int = 32
+    bc_input_noise_std: float = 0.0  # Gaussian noise on (visual, proprio) during BC only.
 
 
 class VideoActorTrainer:
@@ -35,13 +37,18 @@ class VideoActorTrainer:
         *,
         actor: Actor,
         dynamics: ForwardDynamicsModel,
-        backbone: torch.nn.Module,
+        backbone: torch.nn.Module | None,
         sampler: VideoFramePairSampler,
         config: VideoActorTrainerConfig,
         device: torch.device,
     ) -> None:
         if config.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {config.batch_size}")
+        if backbone is None and not sampler.has_state:
+            raise ValueError(
+                "VideoActorTrainer needs either a visual backbone or a sampler with "
+                "per-frame privileged state; got neither"
+            )
 
         self.actor = actor
         self.dynamics = dynamics
@@ -58,12 +65,17 @@ class VideoActorTrainer:
     def train_step(self) -> dict[str, float]:
         self.actor.train()
         self.dynamics.eval()
-        self.backbone.eval()
+        if self.backbone is not None:
+            self.backbone.eval()
 
         batch = self.sampler.sample(self.config.batch_size, self.device)
-        with torch.no_grad():
-            start_visual = encode_images(self.backbone, batch.start_rgb, self.device)
-            goal_visual = encode_images(self.backbone, batch.goal_rgb, self.device)
+        if self.backbone is None:
+            start_visual = batch.start_state.to(self.device)
+            goal_visual = batch.goal_state.to(self.device)
+        else:
+            with torch.no_grad():
+                start_visual = encode_images(self.backbone, batch.start_rgb, self.device)
+                goal_visual = encode_images(self.backbone, batch.goal_rgb, self.device)
         start_proprio = batch.start_proprio.to(self.device)
 
         gaps = batch.frame_gaps.to(self.device).long()
@@ -80,6 +92,36 @@ class VideoActorTrainer:
             "cosine": float(cosine.detach().cpu()),
             "action_abs_mean": action_abs_mean,
             "frame_gap_mean": float(batch.frame_gaps.mean().detach().cpu()),
+            "grad_norm": grad_norm,
+        }
+
+    def bc_train_step(self, batch: DynamicsBatch) -> dict[str, float]:
+        """Direct behavioral-cloning: MSE(actor(state, proprio), expert_action).
+
+        Bypasses the dynamics rollout entirely. Optional Gaussian noise on the
+        input (state, proprio) creates synthetic OOD samples each step — a
+        cheap DART-style augmentation that helps the actor recover from the
+        small state deviations its own closed-loop control introduces.
+        """
+        self.actor.train()
+        visual = batch.visual
+        proprio = batch.proprio
+        noise_std = self.config.bc_input_noise_std
+        if noise_std > 0.0:
+            visual = visual + torch.randn_like(visual) * noise_std
+            proprio = proprio + torch.randn_like(proprio) * noise_std
+        pred_action = self.actor(visual, proprio)
+        loss = F.mse_loss(pred_action, batch.action)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = self._clip_grad_norm()
+        self.optimizer.step()
+        return {
+            "loss": float(loss.detach().cpu()),
+            "cosine": float("nan"),
+            "action_abs_mean": float(pred_action.detach().abs().mean().cpu()),
+            "action_label_abs_mean": float(batch.action.detach().abs().mean().cpu()),
+            "frame_gap_mean": float("nan"),
             "grad_norm": grad_norm,
         }
 

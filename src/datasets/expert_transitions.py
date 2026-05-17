@@ -37,6 +37,7 @@ class ExpertTransitionRecord:
     video_path: Path
     actions_path: Path
     proprio_path: Path
+    state_path: Path | None
     num_actions: int
 
 
@@ -50,16 +51,21 @@ def seed_buffer_with_expert(
     *,
     buffer: TransitionReplayBuffer,
     dataset_dir: str | Path,
-    backbone: torch.nn.Module,
+    backbone: torch.nn.Module | None,
     device: torch.device,
     encode_batch_size: int = 256,
     use_cache: bool = True,
 ) -> int:
     """Encode every expert transition once and push it into the replay buffer.
 
-    Per-episode encoded R3M features are cached under
-    ``dataset_dir/encoded/{model}_{precision}/episode_NNNNNN.npy`` so subsequent
-    runs skip mp4 decode and the R3M forward entirely.
+    When ``backbone`` is provided, the per-frame R3M features are computed and
+    cached under ``dataset_dir/encoded/{model}_{precision}/episode_NNNNNN.npy``
+    so subsequent runs skip mp4 decode and the R3M forward entirely.
+
+    When ``backbone`` is ``None``, the encoded features are replaced by the
+    per-frame privileged state vector loaded from each episode's ``state.npy``
+    — a diagnostic mode for training dynamics on simulator state instead of
+    visual features.
 
     Returns the number of transitions added. The caller is responsible for
     calling ``buffer.pin_current_contents()`` after this if expert data should
@@ -73,12 +79,18 @@ def seed_buffer_with_expert(
             f"expert dataset has {total} transitions but buffer capacity is "
             f"{buffer.capacity}; allocate a larger buffer before seeding"
         )
-    cache_dir = dataset_dir / "encoded" / _backbone_cache_key(backbone) if use_cache else None
+    use_privileged_state = backbone is None
+    cache_dir = (
+        dataset_dir / "encoded" / _backbone_cache_key(backbone)
+        if use_cache and not use_privileged_state
+        else None
+    )
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     added = 0
     cache_hits = 0
-    progress = tqdm(records, desc="seed/expert", unit="episode", dynamic_ncols=True, leave=True)
+    desc = "seed/expert-state" if use_privileged_state else "seed/expert"
+    progress = tqdm(records, desc=desc, unit="episode", dynamic_ncols=True, leave=True)
     for record in progress:
         actions = np.asarray(np.load(record.actions_path), dtype=np.float32)
         proprio = np.asarray(np.load(record.proprio_path), dtype=np.float32)
@@ -86,19 +98,31 @@ def seed_buffer_with_expert(
             raise ValueError(
                 f"expected proprio shape (T, D), got {proprio.shape} for {record.proprio_path}"
             )
-        cache_path = (
-            cache_dir / f"{record.video_path.stem}.npy" if cache_dir is not None else None
-        )
-        features = _load_or_encode_features(
-            record=record,
-            cache_path=cache_path,
-            backbone=backbone,
-            device=device,
-            encode_batch_size=encode_batch_size,
-            num_actions=actions.shape[0],
-        )
-        if cache_path is not None and cache_path.exists():
-            cache_hits += 1
+        if use_privileged_state:
+            if record.state_path is None:
+                raise ValueError(
+                    f"manifest entry for {record.video_path} has no state_path; "
+                    "rebuild the dataset to include per-frame privileged state"
+                )
+            features = np.asarray(np.load(record.state_path), dtype=np.float32)
+            if features.ndim != 2:
+                raise ValueError(
+                    f"expected state shape (T, D), got {features.shape} for {record.state_path}"
+                )
+        else:
+            cache_path = (
+                cache_dir / f"{record.video_path.stem}.npy" if cache_dir is not None else None
+            )
+            features = _load_or_encode_features(
+                record=record,
+                cache_path=cache_path,
+                backbone=backbone,
+                device=device,
+                encode_batch_size=encode_batch_size,
+                num_actions=actions.shape[0],
+            )
+            if cache_path is not None and cache_path.exists():
+                cache_hits += 1
         num_pairs = min(features.shape[0] - 1, actions.shape[0], proprio.shape[0] - 1)
         if num_pairs < 1:
             continue
@@ -180,11 +204,18 @@ def load_transition_records(dataset_dir: Path) -> list[ExpertTransitionRecord]:
                 raise FileNotFoundError(f"actions file missing: {actions_path}")
             if not proprio_path.exists():
                 raise FileNotFoundError(f"proprio file missing: {proprio_path}")
+            state_str = item.get("state_path")
+            state_path: Path | None = None
+            if state_str:
+                state_path = _resolve(state_str, dataset_dir)
+                if not state_path.exists():
+                    raise FileNotFoundError(f"state file missing: {state_path}")
             records.append(
                 ExpertTransitionRecord(
                     video_path=video_path,
                     actions_path=actions_path,
                     proprio_path=proprio_path,
+                    state_path=state_path,
                     num_actions=int(item["num_actions"]),
                 )
             )
