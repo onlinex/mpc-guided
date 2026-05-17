@@ -69,13 +69,13 @@ class TrainDynamicsConfig:
     collection_rounds: int = 40
     episodes_per_round: int = 32
     max_steps: int = 100
-    buffer_capacity: int = 50_000
+    buffer_capacity: int = 200_000
     train_steps_per_round: int = 50
     batch_size: int = 128
     lr: float = 1e-4
     weight_decay: float = 3e-3
     grad_clip_norm: float | None = 10.0
-    hidden_dims: tuple[int, ...] = (256, 256)
+    hidden_dims: tuple[int, ...] = (512, 512)
     actor_hidden_dims: tuple[int, ...] = (256, 256)
     log_dir: str = "runs/dynamics"
     run_name: str | None = None
@@ -473,6 +473,35 @@ def train_round(
     return train_step, actor_train_step
 
 
+def _log_per_source_eval(
+    *,
+    trainer: DynamicsTrainer,
+    buffer: TransitionReplayBuffer,
+    batch_size: int,
+    device: torch.device,
+    writer: SummaryWriter,
+    step: int,
+    prefix: str,
+) -> None:
+    """Log identity-ratio separately for expert and on-policy slices of the buffer.
+
+    Lets us see whether dynamics regression is being driven by losing the expert
+    fit, gaining on-policy fit slowly, or both. Skips a slice silently when it
+    has no data (e.g. on-policy is empty before the first collection round).
+    """
+    for source, batch in (
+        ("expert", buffer.sample_expert(batch_size, device)),
+        ("on_policy", buffer.sample_on_policy(batch_size, device)),
+    ):
+        if batch is None:
+            continue
+        m = trainer.eval_step(batch)
+        writer.add_scalar(f"{prefix}/visual_identity_loss_ratio_{source}", m["visual_identity_loss_ratio"], step)
+        writer.add_scalar(f"{prefix}/proprio_identity_loss_ratio_{source}", m["proprio_identity_loss_ratio"], step)
+        writer.add_scalar(f"{prefix}/visual_loss_{source}", m["visual_loss"], step)
+        writer.add_scalar(f"{prefix}/proprio_loss_{source}", m["proprio_loss"], step)
+
+
 def _train_dynamics_phase(
     *,
     trainer: DynamicsTrainer,
@@ -521,6 +550,15 @@ def _train_dynamics_phase(
                 "dynamics/proprio_identity_loss_ratio",
                 eval_metrics["proprio_identity_loss_ratio"],
                 train_step,
+            )
+            _log_per_source_eval(
+                trainer=trainer,
+                buffer=buffer,
+                batch_size=cfg.batch_size,
+                device=device,
+                writer=writer,
+                step=train_step,
+                prefix="dynamics",
             )
         progress.set_postfix(
             step=next_train_step,
@@ -713,6 +751,15 @@ def seed_and_pretrain(
                 "pretrain/dynamics_proprio_identity_loss_ratio",
                 eval_metrics["proprio_identity_loss_ratio"],
                 step,
+            )
+            _log_per_source_eval(
+                trainer=trainer,
+                buffer=buffer,
+                batch_size=cfg.pretrain_batch_size,
+                device=device,
+                writer=writer,
+                step=step,
+                prefix="pretrain/dynamics",
             )
         progress.set_postfix(
             loss=f"{metrics['loss']:.4f}",

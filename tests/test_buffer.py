@@ -76,6 +76,48 @@ def test_pin_protects_initial_entries():
     assert pinned_vals == {0.0, 1.0}
 
 
+def test_sample_expert_returns_only_pinned_region():
+    buf = _make_buffer(capacity=8)
+    _add_n(buf, 3)  # values 0, 1, 2 -> pinned
+    buf.pin_current_contents()
+    _add_n(buf, 5, offset=100)  # values 100..104 -> on-policy
+
+    seen = set()
+    for _ in range(50):
+        batch = buf.sample_expert(4, device=torch.device("cpu"))
+        for v in batch.visual[:, 0].tolist():
+            seen.add(float(v))
+    assert seen <= {0.0, 1.0, 2.0}, f"expert sample leaked into on-policy: {seen}"
+
+
+def test_sample_on_policy_returns_only_unpinned_region():
+    buf = _make_buffer(capacity=8)
+    _add_n(buf, 3)
+    buf.pin_current_contents()
+    _add_n(buf, 4, offset=100)  # 100, 101, 102, 103
+
+    seen = set()
+    for _ in range(50):
+        batch = buf.sample_on_policy(4, device=torch.device("cpu"))
+        for v in batch.visual[:, 0].tolist():
+            seen.add(float(v))
+    assert seen <= {100.0, 101.0, 102.0, 103.0}, f"on-policy sample leaked into expert: {seen}"
+
+
+def test_sample_on_policy_is_none_when_empty():
+    buf = _make_buffer(capacity=8)
+    _add_n(buf, 3)
+    buf.pin_current_contents()
+    assert buf.sample_on_policy(4, device=torch.device("cpu")) is None
+
+
+def test_sample_expert_is_none_when_unpinned():
+    buf = _make_buffer(capacity=8)
+    _add_n(buf, 3)
+    # never pinned
+    assert buf.sample_expert(4, device=torch.device("cpu")) is None
+
+
 def test_add_validates_shapes():
     buf = _make_buffer(visual_dim=4)
     with pytest.raises(ValueError):

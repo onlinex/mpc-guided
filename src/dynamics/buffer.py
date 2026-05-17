@@ -109,6 +109,24 @@ class TransitionReplayBuffer:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         indices = self._rng.integers(0, self._size, size=batch_size)
+        return self._gather(indices, device)
+
+    def sample_expert(self, batch_size: int, device: torch.device) -> DynamicsBatch | None:
+        """Sample only from the pinned (expert) region. Returns None if empty."""
+        if self._pinned == 0:
+            return None
+        indices = self._rng.integers(0, self._pinned, size=batch_size)
+        return self._gather(indices, device)
+
+    def sample_on_policy(self, batch_size: int, device: torch.device) -> DynamicsBatch | None:
+        """Sample only from the un-pinned (on-policy) region. Returns None if empty."""
+        on_policy_size = self._size - self._pinned
+        if on_policy_size <= 0:
+            return None
+        indices = self._pinned + self._rng.integers(0, on_policy_size, size=batch_size)
+        return self._gather(indices, device)
+
+    def _gather(self, indices: np.ndarray, device: torch.device) -> DynamicsBatch:
         return DynamicsBatch(
             visual=torch.as_tensor(self._visual[indices], device=device),
             proprio=torch.as_tensor(self._proprio[indices], device=device),
