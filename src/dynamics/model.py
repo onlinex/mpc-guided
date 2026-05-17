@@ -17,7 +17,7 @@ class ForwardDynamicsConfig:
     action_dim: int
     visual_dim: int = 512
     proprio_dim: int = 0
-    hidden_dims: tuple[int, ...] = (1024, 1024)
+    hidden_dims: tuple[int, ...] = (256, 256)
     activation: str = "silu"
     layer_norm: bool = True
     dropout: float = 0.0

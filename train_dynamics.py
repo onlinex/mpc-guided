@@ -75,7 +75,8 @@ class TrainDynamicsConfig:
     lr: float = 1e-4
     weight_decay: float = 3e-3
     grad_clip_norm: float | None = 10.0
-    hidden_dims: tuple[int, ...] = (1024, 1024)
+    hidden_dims: tuple[int, ...] = (256, 256)
+    actor_hidden_dims: tuple[int, ...] = (256, 256)
     log_dir: str = "runs/dynamics"
     run_name: str | None = None
     log_interval: int = 50
@@ -136,7 +137,16 @@ def parse_args() -> TrainDynamicsConfig:
     p.add_argument("--lr", type=float, default=defaults.lr)
     p.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
     p.add_argument("--grad-clip-norm", type=float, default=defaults.grad_clip_norm)
-    p.add_argument("--hidden-dims", default=",".join(str(x) for x in defaults.hidden_dims))
+    p.add_argument(
+        "--hidden-dims",
+        default=",".join(str(x) for x in defaults.hidden_dims),
+        help="Comma-separated MLP hidden sizes for the DYNAMICS network.",
+    )
+    p.add_argument(
+        "--actor-hidden-dims",
+        default=",".join(str(x) for x in defaults.actor_hidden_dims),
+        help="Comma-separated MLP hidden sizes for the ACTOR network.",
+    )
     p.add_argument("--log-dir", default=defaults.log_dir)
     p.add_argument("--run-name", default=defaults.run_name)
     p.add_argument("--log-interval", type=int, default=defaults.log_interval)
@@ -231,6 +241,9 @@ def parse_args() -> TrainDynamicsConfig:
     hidden_dims = tuple(int(x) for x in args.hidden_dims.split(",") if x)
     if not hidden_dims:
         p.error("--hidden-dims must contain at least one layer size")
+    actor_hidden_dims = tuple(int(x) for x in args.actor_hidden_dims.split(",") if x)
+    if not actor_hidden_dims:
+        p.error("--actor-hidden-dims must contain at least one layer size")
     for field in (
         "initial_episodes",
         "collection_rounds",
@@ -262,6 +275,7 @@ def parse_args() -> TrainDynamicsConfig:
             **vars(args),
             "obs_mode": "rgb",
             "hidden_dims": hidden_dims,
+            "actor_hidden_dims": actor_hidden_dims,
         }
     )
 
@@ -806,7 +820,12 @@ def run(cfg: TrainDynamicsConfig) -> None:
             seed=cfg.seed,
         )
         actor = Actor(
-            ActorConfig(action_dim=action_dim, visual_dim=visual_dim, proprio_dim=proprio_dim),
+            ActorConfig(
+                action_dim=action_dim,
+                visual_dim=visual_dim,
+                proprio_dim=proprio_dim,
+                hidden_dims=cfg.actor_hidden_dims,
+            ),
             action_low=torch.as_tensor(action_space.low, dtype=torch.float32),
             action_high=torch.as_tensor(action_space.high, dtype=torch.float32),
         ).to(device)
