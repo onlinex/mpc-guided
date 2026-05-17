@@ -51,6 +51,13 @@ class ForwardDynamicsModel(nn.Module):
             layer_norm=config.layer_norm,
             dropout=config.dropout,
         )
+        # Zero-init the delta head so the model starts at identity (next = current).
+        # Without this, Xavier-scale noise from the final layer dominates the tiny
+        # frame-to-frame R3M delta and the model spends most of training clawing
+        # back to identity before it can learn anything useful.
+        final_linear = self.net.net[-1]
+        nn.init.zeros_(final_linear.weight)
+        nn.init.zeros_(final_linear.bias)
 
     @property
     def visual_dim(self) -> int:

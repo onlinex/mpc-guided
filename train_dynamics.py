@@ -206,7 +206,6 @@ def parse_args() -> TrainDynamicsConfig:
         "episodes_per_round",
         "max_steps",
         "buffer_capacity",
-        "train_steps_per_round",
         "batch_size",
         "log_interval",
         "actor_batch_size",
@@ -217,6 +216,8 @@ def parse_args() -> TrainDynamicsConfig:
     ):
         if getattr(args, field) < 1:
             p.error(f"--{field.replace('_', '-')} must be >= 1")
+    if args.train_steps_per_round < 0:
+        p.error("--train-steps-per-round must be >= 0 (use 0 to freeze dynamics)")
     if args.actor_train_steps_per_round < 0:
         p.error("--actor-train-steps-per-round must be >= 0")
     if args.pretrain_dynamics_steps < 0:
@@ -421,6 +422,14 @@ def _train_dynamics_phase(
     train_step: int,
     round_idx: int,
 ) -> tuple[int, dict[str, float]]:
+    metrics: dict[str, float] = {
+        "loss": float("nan"),
+        "visual_loss": float("nan"),
+        "proprio_loss": float("nan"),
+        "grad_norm": float("nan"),
+    }
+    if cfg.train_steps_per_round == 0:
+        return train_step, metrics
     progress = tqdm(
         range(cfg.train_steps_per_round),
         desc=f"dynamics/round_{round_idx}",
@@ -428,12 +437,6 @@ def _train_dynamics_phase(
         dynamic_ncols=True,
         leave=True,
     )
-    metrics: dict[str, float] = {
-        "loss": float("nan"),
-        "visual_loss": float("nan"),
-        "proprio_loss": float("nan"),
-        "grad_norm": float("nan"),
-    }
     for _ in progress:
         batch = buffer.sample(cfg.batch_size, device)
         metrics = trainer.train_step(batch)
