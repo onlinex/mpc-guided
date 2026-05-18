@@ -73,6 +73,7 @@ class Args:
     total_loss_weight: float = 1.0
     online_buffer_size: int = 100_000
     online_mix_ratio: float = 0.9
+    explore_sigma: float = 0.0
     seed: int = 42
     sim_backend: str = "physx_cpu"
     max_episode_steps: int = 100
@@ -125,6 +126,14 @@ def parse_args() -> Args:
         help="Fraction of the dynamics-step batch sampled from the online buffer. "
         "0 = pure BC dynamics training (default). Clamped by buffer size early on.",
     )
+    p.add_argument(
+        "--explore-sigma",
+        type=float,
+        default=d.explore_sigma,
+        help="Std-dev of Gaussian noise added to greedy actions during ROLLOUTS only "
+        "(0 = deterministic). Eval is always deterministic. Noisy action is clipped "
+        "to [-1, 1] and stored verbatim in the buffer.",
+    )
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--sim-backend", default=d.sim_backend)
     p.add_argument("--max-episode-steps", type=int, default=d.max_episode_steps)
@@ -163,6 +172,8 @@ def parse_args() -> Args:
         p.error("--online-buffer-size must be >= 1")
     if not 0.0 <= parsed.online_mix_ratio <= 1.0:
         p.error("--online-mix-ratio must be in [0, 1]")
+    if parsed.explore_sigma < 0:
+        p.error("--explore-sigma must be >= 0")
     return Args(**vars(parsed))
 
 
@@ -190,8 +201,14 @@ def collect_rollouts(
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
     buffer: OnlineBuffer,
+    sigma: float,
+    rng: np.random.Generator,
 ) -> None:
-    """Run greedy rollouts purely to populate the buffer. No metrics."""
+    """Greedy + Gaussian-noise rollouts purely to populate the buffer.
+
+    No metrics. Action stored in the buffer is the one actually executed
+    (post-noise, post-clip) so the dynamics model sees ground-truth (s, a, s').
+    """
     actor.eval()
     with torch.no_grad():
         for i in range(num_episodes):
@@ -199,6 +216,11 @@ def collect_rollouts(
             while True:
                 state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
                 action = _act(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
+                if sigma > 0:
+                    action = np.clip(
+                        action + rng.normal(0.0, sigma, size=action.shape).astype(np.float32),
+                        -1.0, 1.0,
+                    )
                 obs, _, terminated, truncated, _ = env.step(action)
                 next_state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
                 buffer.add(state_raw, action, next_state_raw)
@@ -317,6 +339,7 @@ def main() -> None:
         action_dim=ds.action_dim,
     )
     buffer_rng = np.random.default_rng(args.seed)
+    explore_rng = np.random.default_rng(args.seed + 1)
     obs_mean_t = torch.from_numpy(ds.stats.mean.astype(np.float32)).to(device)
     obs_std_t = torch.from_numpy(ds.stats.std.astype(np.float32)).to(device)
     print(f"Device: {device} | run_dir: {run_dir}")
@@ -394,6 +417,8 @@ def main() -> None:
                     obs_mean=ds.stats.mean,
                     obs_std=ds.stats.std,
                     buffer=online_buffer,
+                    sigma=args.explore_sigma,
+                    rng=explore_rng,
                 )
                 metrics = evaluate(
                     env=env,
