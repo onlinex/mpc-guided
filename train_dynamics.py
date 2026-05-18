@@ -15,7 +15,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from src.actor import (
+from src.legacy.actor import (
     Actor,
     ActorConfig,
     VideoActorTrainer,

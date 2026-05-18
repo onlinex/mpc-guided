@@ -1,12 +1,5 @@
-"""Actor modules and public actor interfaces."""
+"""Minimal state-based BC actor. The chunked/squashed/visual flavor lives in src/legacy/actor/."""
 
-from src.actor.config import ActorConfig
 from src.actor.model import Actor
-from src.actor.training import VideoActorTrainer, VideoActorTrainerConfig
 
-__all__ = [
-    "Actor",
-    "ActorConfig",
-    "VideoActorTrainer",
-    "VideoActorTrainerConfig",
-]
+__all__ = ["Actor"]

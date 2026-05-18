@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from src.actor import Actor, ActorConfig
+from src.legacy.actor import Actor, ActorConfig
 
 
 def _make(action_dim=4, visual_dim=6, proprio_dim=3, low=-1.0, high=1.0):

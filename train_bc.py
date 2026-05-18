@@ -1,14 +1,11 @@
-"""Behavior-cloning baseline reading our per-episode dataset format.
+"""Behavior-cloning training on our per-episode dataset format.
 
-Numerically byte-equivalent to train_bc_baseline.py — same Actor (256x256
-ReLU, no squash), same loss (single-action MSE), same optimizer (Adam, lr
-3e-4, batch 1024). The only difference is the data source: this script
-loads our per-episode npy files (state.npy + actions.npy) produced by
-build_dataset.py, instead of a monolithic h5.
+Same numerics as the ManiSkill state-based BC baseline — 256x256 ReLU MLP
+(``src.actor.Actor``), single-action MSE, Adam lr 3e-4, batch 1024 — but
+reads our per-episode npy files (state.npy + actions.npy) produced by
+build_dataset.py instead of a monolithic h5.
 
-Use this when you want the canonical BC numerics on a dataset that also
-carries per-episode video / proprio (for future visual or partial-obs work).
-For a strict upstream reproduction, use train_bc_baseline.py.
+For a strict standalone upstream reproduction, see train_bc_baseline.py.
 """
 
 from __future__ import annotations
@@ -31,8 +28,34 @@ from torch.utils.data import BatchSampler, DataLoader, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from src.actor import Actor
 from src.bc import StateBCDataset
-from train_bc_baseline import Actor, IterationBasedBatchSampler
+
+
+class IterationBasedBatchSampler(BatchSampler):
+    """Resamples from an underlying BatchSampler until num_iterations is reached.
+
+    Vendored from NVIDIA's DeepLearningExamples (same source as upstream
+    ManiSkill bc.py). Lets DataLoader run for a fixed iteration count rather
+    than a fixed number of epochs.
+    """
+
+    def __init__(self, batch_sampler, num_iterations, start_iter=0):
+        self.batch_sampler = batch_sampler
+        self.num_iterations = num_iterations
+        self.start_iter = start_iter
+
+    def __iter__(self):
+        iteration = self.start_iter
+        while iteration <= self.num_iterations:
+            for batch in self.batch_sampler:
+                iteration += 1
+                if iteration > self.num_iterations:
+                    break
+                yield batch
+
+    def __len__(self):
+        return self.num_iterations
 
 
 @dataclass

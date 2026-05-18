@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.actor.model import Actor
+from src.legacy.actor.model import Actor
 from src.backbone import encode_images
 from src.datasets.video_pairs import VideoFramePairSampler
 from src.dynamics.episode_store import WindowBatch

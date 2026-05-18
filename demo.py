@@ -10,7 +10,7 @@ import mani_skill.envs  # noqa: F401
 import numpy as np
 import torch
 
-from src.actor import Actor, ActorConfig
+from src.legacy.actor import Actor, ActorConfig
 from src.backbone import build_backbone
 from src.observations import encode_observation, extract_proprio
 from src.rollout import rollout
