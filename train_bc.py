@@ -72,7 +72,7 @@ class Args:
     actor_loss_weight: float = 0.0
     total_loss_weight: float = 1.0
     online_buffer_size: int = 100_000
-    online_mix_ratio: float = 0.9
+    online_mix_ratio: float = 0.95
     explore_sigma: float = 0.0
     seed: int = 42
     sim_backend: str = "physx_cpu"
