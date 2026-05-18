@@ -28,7 +28,7 @@ from torch.utils.data import BatchSampler, DataLoader, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from src.actor import Actor
+from src.actor import Actor, ForwardModel
 from src.bc import StateBCDataset
 
 
@@ -209,23 +209,37 @@ def main() -> None:
 
     actor = Actor(ds.state_dim, ds.action_dim).to(device)
     optimizer = optim.Adam(actor.parameters(), lr=args.lr)
+    forward_model = ForwardModel(ds.state_dim, ds.action_dim).to(device)
+    forward_optimizer = optim.Adam(forward_model.parameters(), lr=args.lr)
     print(f"Device: {device} | run_dir: {run_dir}")
     print(f"Actor params: {sum(p.numel() for p in actor.parameters())}")
+    print(f"ForwardModel params: {sum(p.numel() for p in forward_model.parameters())}")
 
     best_eval = defaultdict(float)
     try:
         for iteration, batch in enumerate(
             tqdm(dataloader, total=args.total_iters, desc="bc/train")
         ):
-            obs, action = batch
+            obs, action, next_obs = batch
+
+            # Actor update.
             pred = actor(obs)
             loss = F.mse_loss(pred, action)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            # Forward-model update (independent optimizer; gradients can't leak
+            # into the actor since obs/action are leaf tensors here).
+            pred_next = forward_model(obs, action)
+            fwd_loss = F.mse_loss(pred_next, next_obs)
+            forward_optimizer.zero_grad()
+            fwd_loss.backward()
+            forward_optimizer.step()
+
             if iteration % args.log_freq == 0:
-                writer.add_scalar("losses/total_loss", float(loss.detach().cpu()), iteration)
+                writer.add_scalar("losses/actor_loss", float(loss.detach().cpu()), iteration)
+                writer.add_scalar("losses/dynamics_loss", float(fwd_loss.detach().cpu()), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
 
             if iteration % args.eval_freq == 0:
@@ -252,6 +266,7 @@ def main() -> None:
                         torch.save(
                             {
                                 "actor": actor.state_dict(),
+                                "forward_model": forward_model.state_dict(),
                                 "iter": iteration,
                                 "metrics": metrics,
                                 "args": asdict(args),
@@ -261,7 +276,11 @@ def main() -> None:
 
             if args.save_freq is not None and iteration % args.save_freq == 0:
                 torch.save(
-                    {"actor": actor.state_dict(), "iter": iteration},
+                    {
+                        "actor": actor.state_dict(),
+                        "forward_model": forward_model.state_dict(),
+                        "iter": iteration,
+                    },
                     ckpt_dir / f"step_{iteration}.pt",
                 )
     finally:

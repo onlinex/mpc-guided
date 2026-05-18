@@ -59,7 +59,7 @@ class StateBCDataset(Dataset):
         if not records:
             raise ValueError(f"no episodes in {manifest_path}")
 
-        obs_list, act_list = [], []
+        obs_list, act_list, next_obs_list = [], [], []
         for rec in tqdm(records, desc="bc/load", unit="ep"):
             state = np.load(rec["state_path"]).astype(np.float32)
             actions = np.load(rec["actions_path"]).astype(np.float32)
@@ -68,10 +68,12 @@ class StateBCDataset(Dataset):
                 continue
             obs_list.append(state[:T])
             act_list.append(actions[:T])
+            next_obs_list.append(state[1 : T + 1])
 
         self.observations = np.vstack(obs_list).astype(np.float32)
         self.actions = np.vstack(act_list).astype(np.float32)
-        assert self.observations.shape[0] == self.actions.shape[0]
+        self.next_observations = np.vstack(next_obs_list).astype(np.float32)
+        assert self.observations.shape[0] == self.actions.shape[0] == self.next_observations.shape[0]
 
         self.state_dim = int(self.observations.shape[1])
         self.action_dim = int(self.actions.shape[1])
@@ -84,6 +86,9 @@ class StateBCDataset(Dataset):
             std[std < 1e-6] = 1.0  # guard against constant dims
             self.stats = DatasetStats(mean=mean, std=std)
             self.observations = (self.observations - mean) / std
+            # Same normalization applied to next_obs so dynamics targets live in
+            # the same space as its inputs.
+            self.next_observations = (self.next_observations - mean) / std
         else:
             self.stats = DatasetStats(
                 mean=np.zeros(self.state_dim, dtype=np.float32),
@@ -93,7 +98,8 @@ class StateBCDataset(Dataset):
     def __len__(self) -> int:
         return self.observations.shape[0]
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = torch.from_numpy(self.observations[idx]).float().to(self.device)
         act = torch.from_numpy(self.actions[idx]).float().to(self.device)
-        return obs, act
+        next_obs = torch.from_numpy(self.next_observations[idx]).float().to(self.device)
+        return obs, act, next_obs
