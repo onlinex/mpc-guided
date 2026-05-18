@@ -104,9 +104,9 @@ actor_step_loss = actor_loss_weight * actor_loss + total_loss_weight * total_los
 
 | `--actor-loss-weight` | `--total-loss-weight` | Behavior |
 |---|---|---|
-| `1.0` (default) | `0.0` (default) | Pure BC. ForwardModel still trains but doesn't influence actor. `total_loss` logged as diagnostic. |
+| `0.0` (default) | `1.0` (default) | Pure model-based imitation. Actor only sees expert states; learns to produce actions that the (jointly-trained) forward model maps onto expert next states. On PickCube reaches comparable final reward to direct BC, slightly worse actor_loss along the way. |
 | `1.0` | `> 0` | Joint: direct BC + model-grounded regularization. Robust on PickCube; on this dataset `1.0`/`5.0` train as well as pure BC. |
-| `0.0` | `> 0` | Pure model-based imitation. Actor only sees expert states; learns to produce actions that the (jointly-trained) forward model maps onto expert next states. On PickCube reaches comparable final reward to direct BC, slightly worse actor_loss along the way. |
+| `1.0` | `0.0` | Pure BC. ForwardModel still trains but doesn't influence actor. `total_loss` logged as diagnostic. |
 
 `total_loss - dynamics_loss` is a useful compounding-error diagnostic: with the
 actor in-distribution it's small; if the actor drifts off-policy w.r.t. forward

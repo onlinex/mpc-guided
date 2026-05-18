@@ -68,8 +68,8 @@ class Args:
     batch_size: int = 1024
     lr: float = 3e-4
     normalize_states: bool = False
-    actor_loss_weight: float = 1.0
-    total_loss_weight: float = 0.0
+    actor_loss_weight: float = 0.0
+    total_loss_weight: float = 1.0
     seed: int = 42
     sim_backend: str = "physx_cpu"
     max_episode_steps: int = 100
@@ -98,15 +98,15 @@ def parse_args() -> Args:
         type=float,
         default=d.actor_loss_weight,
         help="Weight on the direct BC actor loss MSE(actor(obs), expert_action). "
-        "Default 1.0. Set to 0 to train the actor PURELY from --total-loss-weight.",
+        "Default 0.0 (pure model-based imitation). Set > 0 to mix in direct BC.",
     )
     p.add_argument(
         "--total-loss-weight",
         type=float,
         default=d.total_loss_weight,
         help="Weight on the model-based actor loss "
-        "MSE(forward(obs, actor(obs)), next_obs). 0 = pure BC (default). "
-        "Small values (0.01-0.1) act as model-grounded regularization.",
+        "MSE(forward(obs, actor(obs)), next_obs). Default 1.0 (pure model-based). "
+        "Set to 0 with --actor-loss-weight 1 for pure BC.",
     )
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--sim-backend", default=d.sim_backend)
