@@ -27,10 +27,7 @@ from src.backbone import (
     R3M_MODEL_IDS,
     build_backbone,
 )
-from src.datasets.expert_transitions import (
-    count_expert_transitions,
-    seed_buffer_with_expert,
-)
+from src.datasets.expert_transitions import seed_store_with_expert
 from src.datasets.video_pairs import VideoFramePairSampler
 from src.observations import (
     encode_observation,
@@ -42,9 +39,10 @@ from src.observations import (
 from src.dynamics import (
     DynamicsTrainer,
     DynamicsTrainerConfig,
+    EpisodeStore,
     ForwardDynamicsConfig,
     ForwardDynamicsModel,
-    TransitionReplayBuffer,
+    RolloutAccumulator,
 )
 from src.utils import OUNoise, pick_device, to_scalar_bool
 
@@ -72,6 +70,8 @@ class TrainDynamicsConfig:
     buffer_capacity: int = 200_000
     train_steps_per_round: int = 50
     batch_size: int = 128
+    dynamics_rollout_horizon: int = 1
+    dynamics_rollout_discount: float = 1.0
     lr: float = 1e-4
     weight_decay: float = 3e-3
     grad_clip_norm: float | None = 10.0
@@ -130,10 +130,24 @@ def parse_args() -> TrainDynamicsConfig:
         "--buffer-capacity",
         type=int,
         default=defaults.buffer_capacity,
-        help="On-policy slots in the replay buffer. Pinned expert transitions are added on top.",
+        help="On-policy transition budget in the episode store. Pinned expert episodes don't count toward this and never evict.",
     )
     p.add_argument("--train-steps-per-round", type=int, default=defaults.train_steps_per_round)
     p.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    p.add_argument(
+        "--dynamics-rollout-horizon",
+        type=int,
+        default=defaults.dynamics_rollout_horizon,
+        help="Steps to roll the model forward per dynamics update. H=1 reproduces the "
+        "single-step loss; H>1 trains against compounding error by feeding predictions "
+        "back in (teacher-forced actions only).",
+    )
+    p.add_argument(
+        "--dynamics-rollout-discount",
+        type=float,
+        default=defaults.dynamics_rollout_discount,
+        help="Per-step weight in the multi-step loss; 1.0 = uniform across the horizon.",
+    )
     p.add_argument("--lr", type=float, default=defaults.lr)
     p.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
     p.add_argument("--grad-clip-norm", type=float, default=defaults.grad_clip_norm)
@@ -262,6 +276,10 @@ def parse_args() -> TrainDynamicsConfig:
             p.error(f"--{field.replace('_', '-')} must be >= 1")
     if args.train_steps_per_round < 0:
         p.error("--train-steps-per-round must be >= 0 (use 0 to freeze dynamics)")
+    if args.dynamics_rollout_horizon < 1:
+        p.error("--dynamics-rollout-horizon must be >= 1")
+    if args.dynamics_rollout_discount <= 0:
+        p.error("--dynamics-rollout-discount must be > 0")
     if args.actor_train_steps_per_round < 0:
         p.error("--actor-train-steps-per-round must be >= 0")
     if args.pretrain_dynamics_steps < 0:
@@ -332,7 +350,8 @@ def collect_actor_episodes(
     *,
     env: gym.Env,
     actor: Actor,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
+    accumulator: RolloutAccumulator,
     backbone: torch.nn.Module | None,
     device: torch.device,
     cfg: TrainDynamicsConfig,
@@ -355,6 +374,7 @@ def collect_actor_episodes(
         obs, _ = env.reset(seed=cfg.seed + global_episode)
         visual = _visual_from_obs(obs, backbone=backbone, device=device, camera_uid=cfg.camera_uid)
         proprio = extract_proprio(env)
+        accumulator.start_episode(visual, proprio)
         if ou_noise is not None:
             ou_noise.reset()
         ep_return, succeeded = 0.0, False
@@ -373,7 +393,7 @@ def collect_actor_episodes(
                 next_obs, backbone=backbone, device=device, camera_uid=cfg.camera_uid
             )
             next_proprio = extract_proprio(env)
-            buffer.add(visual, proprio, action, next_visual, next_proprio)
+            accumulator.append_step(action, next_visual, next_proprio)
 
             episode_actions.append(action)
             ep_return += float(np.asarray(reward).reshape(-1)[0])
@@ -385,6 +405,8 @@ def collect_actor_episodes(
             done = to_scalar_bool(terminated) or to_scalar_bool(truncated)
             if done:
                 break
+
+        accumulator.finish_episode(pinned=False)
 
         action_within_episode_std = (
             float(np.stack(episode_actions, axis=0).std(axis=0).mean())
@@ -409,13 +431,13 @@ def collect_actor_episodes(
             action_within_episode_std,
             global_episode,
         )
-        writer.add_scalar("replay_buffer/size", len(buffer), global_step)
+        writer.add_scalar("replay_buffer/size", store.num_transitions, global_step)
         progress.set_postfix(
             episode=global_episode,
             steps=ep_step + 1,
             ret=f"{ep_return:.2f}",
             success=int(succeeded),
-            buffer=len(buffer),
+            buffer=store.num_transitions,
             action=f"{action_abs_sum / (ep_step + 1):.2f}",
             noise=f"{(noise_abs_sum / (ep_step + 1)) if ou_noise is not None else 0.0:.2f}",
         )
@@ -428,7 +450,7 @@ def train_round(
     trainer: DynamicsTrainer,
     actor: Actor,
     actor_video_trainer: VideoActorTrainer | None,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
     cfg: TrainDynamicsConfig,
     writer: SummaryWriter,
     device: torch.device,
@@ -439,7 +461,7 @@ def train_round(
 ) -> tuple[int, int]:
     train_step, last_dyn_metrics = _train_dynamics_phase(
         trainer=trainer,
-        buffer=buffer,
+        store=store,
         cfg=cfg,
         writer=writer,
         device=device,
@@ -448,7 +470,7 @@ def train_round(
     )
     actor_train_step = _train_actor_phase(
         actor_video_trainer=actor_video_trainer,
-        buffer=buffer,
+        store=store,
         cfg=cfg,
         device=device,
         writer=writer,
@@ -476,23 +498,21 @@ def train_round(
 def _log_per_source_eval(
     *,
     trainer: DynamicsTrainer,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
     batch_size: int,
     device: torch.device,
     writer: SummaryWriter,
     step: int,
     prefix: str,
 ) -> None:
-    """Log identity-ratio separately for expert and on-policy slices of the buffer.
+    """Log identity-ratio separately for expert and on-policy slices of the store.
 
     Lets us see whether dynamics regression is being driven by losing the expert
     fit, gaining on-policy fit slowly, or both. Skips a slice silently when it
     has no data (e.g. on-policy is empty before the first collection round).
     """
-    for source, batch in (
-        ("expert", buffer.sample_expert(batch_size, device)),
-        ("on_policy", buffer.sample_on_policy(batch_size, device)),
-    ):
+    for source in ("expert", "on_policy"):
+        batch = store.sample(batch_size, source=source, device=device)
         if batch is None:
             continue
         m = trainer.eval_step(batch)
@@ -505,7 +525,7 @@ def _log_per_source_eval(
 def _train_dynamics_phase(
     *,
     trainer: DynamicsTrainer,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
     cfg: TrainDynamicsConfig,
     writer: SummaryWriter,
     device: torch.device,
@@ -527,8 +547,13 @@ def _train_dynamics_phase(
         dynamic_ncols=True,
         leave=True,
     )
+    H = cfg.dynamics_rollout_horizon
     for _ in progress:
-        batch = buffer.sample(cfg.batch_size, device)
+        batch = store.sample(cfg.batch_size, horizon=H, device=device)
+        if batch is None:
+            raise RuntimeError(
+                f"no episodes long enough for horizon={H}; lower --dynamics-rollout-horizon"
+            )
         metrics = trainer.train_step(batch)
         next_train_step = train_step + 1
         writer.add_scalar("dynamics/train_loss", metrics["loss"], train_step)
@@ -536,7 +561,7 @@ def _train_dynamics_phase(
         writer.add_scalar("dynamics/proprio_loss", metrics["proprio_loss"], train_step)
         writer.add_scalar("dynamics/grad_norm", metrics["grad_norm"], train_step)
         if train_step % 50 == 0:
-            eval_metrics = trainer.eval_step(buffer.sample(cfg.batch_size, device))
+            eval_metrics = trainer.eval_step(store.sample(cfg.batch_size, device=device))
             writer.add_scalar("dynamics/eval_loss", eval_metrics["loss"], train_step)
             writer.add_scalar("dynamics/eval_visual_loss", eval_metrics["visual_loss"], train_step)
             writer.add_scalar("dynamics/eval_proprio_loss", eval_metrics["proprio_loss"], train_step)
@@ -553,7 +578,7 @@ def _train_dynamics_phase(
             )
             _log_per_source_eval(
                 trainer=trainer,
-                buffer=buffer,
+                store=store,
                 batch_size=cfg.batch_size,
                 device=device,
                 writer=writer,
@@ -565,7 +590,7 @@ def _train_dynamics_phase(
             loss=f"{metrics['loss']:.4f}",
             vis=f"{metrics['visual_loss']:.4f}",
             pro=f"{metrics['proprio_loss']:.4f}",
-            buffer=len(buffer),
+            buffer=store.num_transitions,
         )
         if next_train_step % cfg.log_interval == 0:
             tqdm.write(
@@ -580,7 +605,7 @@ def _train_dynamics_phase(
 def _train_actor_phase(
     *,
     actor_video_trainer: VideoActorTrainer | None,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
     cfg: TrainDynamicsConfig,
     device: torch.device,
     writer: SummaryWriter,
@@ -599,7 +624,7 @@ def _train_actor_phase(
     )
     for _ in progress:
         if cfg.actor_bc_mode:
-            batch = buffer.sample(cfg.actor_batch_size, device)
+            batch = store.sample(cfg.actor_batch_size, device=device)
             actor_metrics = actor_video_trainer.bc_train_step(batch)
         else:
             actor_metrics = actor_video_trainer.train_step()
@@ -670,23 +695,10 @@ def deterministic_actor_action(
     return actor(visual_t, proprio_t).squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
-def _resolve_buffer_capacity(cfg: TrainDynamicsConfig) -> int:
-    """Total buffer capacity = on-policy slots (``buffer_capacity``) + pinned expert."""
-    if not cfg.seed_buffer_with_expert:
-        return cfg.buffer_capacity
-    expert = count_expert_transitions(cfg.actor_video_dataset_dir)
-    total = cfg.buffer_capacity + expert
-    tqdm.write(
-        f"Buffer capacity: {cfg.buffer_capacity} on-policy slots + {expert} pinned expert "
-        f"= {total} total"
-    )
-    return total
-
-
 def seed_and_pretrain(
     *,
     trainer: DynamicsTrainer,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
     cfg: TrainDynamicsConfig,
     backbone: torch.nn.Module | None,
     device: torch.device,
@@ -696,30 +708,29 @@ def seed_and_pretrain(
         return
     if cfg.seed_buffer_with_expert:
         tqdm.write(
-            f"Seeding replay buffer with expert transitions from {cfg.actor_video_dataset_dir}"
+            f"Seeding episode store with expert transitions from {cfg.actor_video_dataset_dir}"
         )
-        added = seed_buffer_with_expert(
-            buffer=buffer,
+        added = seed_store_with_expert(
+            store=store,
             dataset_dir=cfg.actor_video_dataset_dir,
             backbone=backbone,
             device=device,
+            pinned=cfg.pin_expert_in_buffer,
         )
-        if cfg.pin_expert_in_buffer:
-            buffer.pin_current_contents()
         tqdm.write(
-            f"Seeded {added} expert transitions "
-            f"(buffer size={len(buffer)}, pinned={buffer.pinned})"
+            f"Seeded {added} expert transitions across {store.num_pinned_episodes} pinned "
+            f"episodes (store size={store.num_transitions})"
         )
         writer.add_scalar("replay_buffer/expert_seeded", added, 0)
-        writer.add_scalar("replay_buffer/pinned", buffer.pinned, 0)
+        writer.add_scalar("replay_buffer/pinned", store.num_pinned_transitions, 0)
 
     if cfg.pretrain_dynamics_steps == 0:
         return
-    if len(buffer) == 0:
-        tqdm.write("Skipping pretrain: replay buffer is empty (enable --seed-buffer-with-expert).")
+    if store.num_transitions == 0:
+        tqdm.write("Skipping pretrain: episode store is empty (enable --seed-buffer-with-expert).")
         return
     tqdm.write(
-        f"Pretraining dynamics on seeded buffer: "
+        f"Pretraining dynamics on seeded store: "
         f"{cfg.pretrain_dynamics_steps} steps x batch {cfg.pretrain_batch_size}"
     )
     progress = tqdm(
@@ -729,15 +740,20 @@ def seed_and_pretrain(
         dynamic_ncols=True,
         leave=True,
     )
+    H = cfg.dynamics_rollout_horizon
     for step in progress:
-        batch = buffer.sample(cfg.pretrain_batch_size, device)
+        batch = store.sample(cfg.pretrain_batch_size, horizon=H, device=device)
+        if batch is None:
+            raise RuntimeError(
+                f"no expert episodes long enough for horizon={H}; lower --dynamics-rollout-horizon"
+            )
         metrics = trainer.train_step(batch)
         writer.add_scalar("pretrain/dynamics_loss", metrics["loss"], step)
         writer.add_scalar("pretrain/dynamics_visual_loss", metrics["visual_loss"], step)
         writer.add_scalar("pretrain/dynamics_proprio_loss", metrics["proprio_loss"], step)
         writer.add_scalar("pretrain/dynamics_grad_norm", metrics["grad_norm"], step)
         if step % 50 == 0:
-            eval_metrics = trainer.eval_step(buffer.sample(cfg.pretrain_batch_size, device))
+            eval_metrics = trainer.eval_step(store.sample(cfg.pretrain_batch_size, device=device))
             writer.add_scalar("pretrain/dynamics_eval_loss", eval_metrics["loss"], step)
             writer.add_scalar(
                 "pretrain/dynamics_eval_visual_cosine", eval_metrics["visual_cosine"], step
@@ -754,7 +770,7 @@ def seed_and_pretrain(
             )
             _log_per_source_eval(
                 trainer=trainer,
-                buffer=buffer,
+                store=store,
                 batch_size=cfg.pretrain_batch_size,
                 device=device,
                 writer=writer,
@@ -856,16 +872,17 @@ def run(cfg: TrainDynamicsConfig) -> None:
                 weight_decay=cfg.weight_decay,
                 grad_clip_norm=cfg.grad_clip_norm,
                 proprio_loss_weight=proprio_loss_weight,
+                rollout_discount=cfg.dynamics_rollout_discount,
             ),
         )
-        effective_capacity = _resolve_buffer_capacity(cfg)
-        buffer = TransitionReplayBuffer(
-            effective_capacity,
+        store = EpisodeStore(
+            capacity_transitions=cfg.buffer_capacity,
             visual_dim=visual_dim,
             proprio_dim=proprio_dim,
             action_dim=action_dim,
             seed=cfg.seed,
         )
+        accumulator = RolloutAccumulator(store)
         actor = Actor(
             ActorConfig(
                 action_dim=action_dim,
@@ -921,7 +938,7 @@ def run(cfg: TrainDynamicsConfig) -> None:
 
         seed_and_pretrain(
             trainer=trainer,
-            buffer=buffer,
+            store=store,
             cfg=cfg,
             backbone=backbone,
             device=device,
@@ -937,7 +954,8 @@ def run(cfg: TrainDynamicsConfig) -> None:
         global_episode, global_step = collect_actor_episodes(
             env=env,
             actor=actor,
-            buffer=buffer,
+            store=store,
+            accumulator=accumulator,
             backbone=backbone,
             device=device,
             cfg=initial_cfg,
@@ -956,7 +974,7 @@ def run(cfg: TrainDynamicsConfig) -> None:
                 trainer=trainer,
                 actor=actor,
                 actor_video_trainer=actor_video_trainer,
-                buffer=buffer,
+                store=store,
                 cfg=cfg,
                 writer=writer,
                 device=device,
@@ -970,7 +988,8 @@ def run(cfg: TrainDynamicsConfig) -> None:
             global_episode, global_step = collect_actor_episodes(
                 env=env,
                 actor=actor,
-                buffer=buffer,
+                store=store,
+                accumulator=accumulator,
                 backbone=backbone,
                 device=device,
                 cfg=cfg,
@@ -992,7 +1011,7 @@ def run(cfg: TrainDynamicsConfig) -> None:
             filename="actor.pt",
         )
         tqdm.write(
-            f"Finished training: episodes={global_episode} transitions={len(buffer)} "
+            f"Finished training: episodes={global_episode} transitions={store.num_transitions} "
             f"env_steps={global_step} train_steps={train_step} "
             f"actor_train_steps={actor_train_step}"
         )

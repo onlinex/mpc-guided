@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from src.actor.model import Actor
 from src.backbone import encode_images
 from src.datasets.video_pairs import VideoFramePairSampler
-from src.dynamics.buffer import DynamicsBatch
+from src.dynamics.episode_store import WindowBatch
 from src.dynamics.model import ForwardDynamicsModel
 
 
@@ -95,23 +95,28 @@ class VideoActorTrainer:
             "grad_norm": grad_norm,
         }
 
-    def bc_train_step(self, batch: DynamicsBatch) -> dict[str, float]:
+    def bc_train_step(self, batch: WindowBatch) -> dict[str, float]:
         """Direct behavioral-cloning: MSE(actor(state, proprio), expert_action).
 
         Bypasses the dynamics rollout entirely. Optional Gaussian noise on the
         input (state, proprio) creates synthetic OOD samples each step — a
         cheap DART-style augmentation that helps the actor recover from the
         small state deviations its own closed-loop control introduces.
+
+        Uses the last context frame as the input state and the first future
+        action as the BC label; ``context > 1`` or ``horizon > 1`` are simply
+        ignored from a loss perspective.
         """
         self.actor.train()
-        visual = batch.visual
-        proprio = batch.proprio
+        visual = batch.visual_context[:, -1]
+        proprio = batch.proprio_context[:, -1]
+        action_label = batch.action[:, 0]
         noise_std = self.config.bc_input_noise_std
         if noise_std > 0.0:
             visual = visual + torch.randn_like(visual) * noise_std
             proprio = proprio + torch.randn_like(proprio) * noise_std
         pred_action = self.actor(visual, proprio)
-        loss = F.mse_loss(pred_action, batch.action)
+        loss = F.mse_loss(pred_action, action_label)
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = self._clip_grad_norm()
@@ -120,7 +125,7 @@ class VideoActorTrainer:
             "loss": float(loss.detach().cpu()),
             "cosine": float("nan"),
             "action_abs_mean": float(pred_action.detach().abs().mean().cpu()),
-            "action_label_abs_mean": float(batch.action.detach().abs().mean().cpu()),
+            "action_label_abs_mean": float(action_label.detach().abs().mean().cpu()),
             "frame_gap_mean": float("nan"),
             "grad_norm": grad_norm,
         }

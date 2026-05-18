@@ -1,0 +1,97 @@
+"""Load a train_bc_baseline checkpoint and play it in the SAPIEN GUI.
+
+Usage:
+  uv run python play_bc_baseline.py \\
+    --checkpoint runs/bc-baseline/pickcube-bc-baseline/checkpoints/best_eval_success_at_end.pt \\
+    --episodes 5
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import gymnasium as gym
+import mani_skill.envs  # noqa: F401
+import numpy as np
+import torch
+
+from train_bc_baseline import Actor
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--checkpoint", required=True, type=Path)
+    p.add_argument("--env-id", default="PickCube-v1")
+    p.add_argument("--control-mode", default="pd_joint_delta_pos")
+    p.add_argument("--sim-backend", default="physx_cpu")
+    p.add_argument("--max-episode-steps", type=int, default=100)
+    p.add_argument("--episodes", type=int, default=5)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-gui", action="store_true",
+                   help="Run without the SAPIEN viewer (just print success/return).")
+    p.add_argument("--video-dir", type=Path, default=None,
+                   help="If set, also save per-episode mp4s via RecordEpisode.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    render_mode = "rgb_array" if args.no_gui else "human"
+    env = gym.make(
+        args.env_id,
+        obs_mode="state",
+        control_mode=args.control_mode,
+        reward_mode="sparse",
+        sim_backend=args.sim_backend,
+        max_episode_steps=args.max_episode_steps,
+        render_mode=render_mode,
+    )
+    if args.video_dir is not None:
+        from mani_skill.utils.wrappers.record import RecordEpisode
+        args.video_dir.mkdir(parents=True, exist_ok=True)
+        env = RecordEpisode(env, output_dir=str(args.video_dir), save_trajectory=False)
+
+    state_dim = int(np.prod(env.observation_space.shape))
+    action_dim = int(np.prod(env.action_space.shape))
+    actor = Actor(state_dim, action_dim).to(device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    actor.load_state_dict(ckpt["actor"])
+    actor.eval()
+    print(f"Loaded {args.checkpoint} (state_dim={state_dim} action_dim={action_dim})")
+
+    try:
+        successes, returns = [], []
+        for ep in range(args.episodes):
+            obs, _ = env.reset(seed=args.seed + ep)
+            ep_return, succeeded, steps = 0.0, False, 0
+            while True:
+                steps += 1
+                if not args.no_gui:
+                    env.render()
+                state = torch.as_tensor(np.asarray(obs).reshape(-1), dtype=torch.float32, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    action = actor(state).squeeze(0).cpu().numpy().astype(np.float32)
+                obs, reward, terminated, truncated, info = env.step(action)
+                ep_return += float(np.asarray(reward).reshape(-1)[0])
+                succeeded = succeeded or bool(np.asarray(info.get("success", False)).reshape(-1)[0])
+                if not args.no_gui:
+                    time.sleep(0.02)  # ~50 Hz playback so the viewer is watchable
+                if bool(np.asarray(terminated).reshape(-1)[0]) or bool(np.asarray(truncated).reshape(-1)[0]):
+                    break
+            successes.append(int(succeeded))
+            returns.append(ep_return)
+            print(f"ep {ep}: success={succeeded} return={ep_return:.2f} steps={steps}")
+        print(
+            f"\nSummary: success={np.mean(successes):.2f} "
+            f"return={np.mean(returns):.2f} over {args.episodes} eps"
+        )
+    finally:
+        env.close()
+
+
+if __name__ == "__main__":
+    main()

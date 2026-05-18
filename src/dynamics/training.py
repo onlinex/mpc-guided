@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from src.dynamics.buffer import DynamicsBatch
+from src.dynamics.episode_store import WindowBatch
 from src.dynamics.model import ForwardDynamicsModel
 
 
@@ -17,10 +17,17 @@ class DynamicsTrainerConfig:
     weight_decay: float = 1e-4
     grad_clip_norm: float | None = 10.0
     proprio_loss_weight: float = 1.0
+    rollout_discount: float = 1.0  # per-step weight in multi-step loss; 1.0 = uniform.
 
 
 class DynamicsTrainer:
-    """Owns optimization for a ``ForwardDynamicsModel`` with split losses."""
+    """Owns optimization for a ``ForwardDynamicsModel`` with split losses.
+
+    ``train_step`` accepts any rollout horizon: it rolls the model forward
+    ``H`` steps from the last context frame, feeds its own predictions back
+    in as state (teacher-forced actions only), and averages per-step MSE.
+    ``H=1`` reduces exactly to the one-step loss used pre-migration.
+    """
 
     def __init__(
         self,
@@ -35,11 +42,26 @@ class DynamicsTrainer:
             weight_decay=config.weight_decay,
         )
 
-    def train_step(self, batch: DynamicsBatch) -> dict[str, float]:
+    def train_step(self, batch: WindowBatch) -> dict[str, float]:
         self.model.train()
-        pred_visual, pred_proprio = self.model(batch.visual, batch.proprio, batch.action)
-        visual_loss = F.mse_loss(pred_visual, batch.next_visual)
-        proprio_loss = F.mse_loss(pred_proprio, batch.next_proprio)
+        visual = batch.visual_context[:, -1]
+        proprio = batch.proprio_context[:, -1]
+        horizon = batch.action.shape[1]
+        gamma = self.config.rollout_discount
+
+        visual_loss = visual.new_zeros(())
+        proprio_loss = visual.new_zeros(())
+        weight_total = 0.0
+        for h in range(horizon):
+            pred_visual, pred_proprio = self.model(visual, proprio, batch.action[:, h])
+            w = gamma ** h
+            visual_loss = visual_loss + w * F.mse_loss(pred_visual, batch.visual_future[:, h])
+            proprio_loss = proprio_loss + w * F.mse_loss(pred_proprio, batch.proprio_future[:, h])
+            weight_total += w
+            visual, proprio = pred_visual, pred_proprio  # rolled-out, NOT teacher-forced
+
+        visual_loss = visual_loss / weight_total
+        proprio_loss = proprio_loss / weight_total
         loss = visual_loss + self.config.proprio_loss_weight * proprio_loss
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -54,15 +76,16 @@ class DynamicsTrainer:
         }
 
     @torch.no_grad()
-    def eval_step(self, batch: DynamicsBatch) -> dict[str, float]:
+    def eval_step(self, batch: WindowBatch) -> dict[str, float]:
+        visual, proprio, action, next_visual, next_proprio = _single_step(batch)
         self.model.eval()
-        pred_visual, pred_proprio = self.model(batch.visual, batch.proprio, batch.action)
-        visual_loss = F.mse_loss(pred_visual, batch.next_visual)
-        proprio_loss = F.mse_loss(pred_proprio, batch.next_proprio)
+        pred_visual, pred_proprio = self.model(visual, proprio, action)
+        visual_loss = F.mse_loss(pred_visual, next_visual)
+        proprio_loss = F.mse_loss(pred_proprio, next_proprio)
         loss = visual_loss + self.config.proprio_loss_weight * proprio_loss
-        cosine = F.cosine_similarity(pred_visual, batch.next_visual, dim=-1).mean()
-        identity_visual = F.mse_loss(batch.visual, batch.next_visual)
-        identity_proprio = F.mse_loss(batch.proprio, batch.next_proprio)
+        cosine = F.cosine_similarity(pred_visual, next_visual, dim=-1).mean()
+        identity_visual = F.mse_loss(visual, next_visual)
+        identity_proprio = F.mse_loss(proprio, next_proprio)
         return {
             "loss": float(loss.cpu()),
             "visual_loss": float(visual_loss.cpu()),
@@ -94,3 +117,21 @@ class DynamicsTrainer:
         if not norms:
             return 0.0
         return float(torch.stack(norms).norm(2).cpu())
+
+
+def _single_step(
+    batch: WindowBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collapse a (context=1, horizon=1) WindowBatch into (s, p, a, s', p') tensors."""
+    if batch.visual_context.shape[1] != 1 or batch.visual_future.shape[1] != 1:
+        raise ValueError(
+            f"single-step trainer expects context=1, horizon=1; got context="
+            f"{batch.visual_context.shape[1]}, horizon={batch.visual_future.shape[1]}"
+        )
+    return (
+        batch.visual_context[:, 0],
+        batch.proprio_context[:, 0],
+        batch.action[:, 0],
+        batch.visual_future[:, 0],
+        batch.proprio_future[:, 0],
+    )

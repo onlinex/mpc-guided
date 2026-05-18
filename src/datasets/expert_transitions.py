@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from src.backbone import encode_images
 from src.datasets.video_pairs import to_uint8
-from src.dynamics.buffer import TransitionReplayBuffer
+from src.dynamics.episode_store import EpisodeStore
 
 
 def _backbone_cache_key(backbone: torch.nn.Module) -> str:
@@ -47,38 +47,30 @@ def count_expert_transitions(dataset_dir: str | Path) -> int:
     return sum(int(record.num_actions) for record in records)
 
 
-def seed_buffer_with_expert(
+def seed_store_with_expert(
     *,
-    buffer: TransitionReplayBuffer,
+    store: EpisodeStore,
     dataset_dir: str | Path,
     backbone: torch.nn.Module | None,
     device: torch.device,
     encode_batch_size: int = 256,
     use_cache: bool = True,
+    pinned: bool = True,
 ) -> int:
-    """Encode every expert transition once and push it into the replay buffer.
+    """Push every expert episode into ``store`` as a single pinned episode.
 
-    When ``backbone`` is provided, the per-frame R3M features are computed and
+    When ``backbone`` is provided, per-frame R3M features are computed and
     cached under ``dataset_dir/encoded/{model}_{precision}/episode_NNNNNN.npy``
     so subsequent runs skip mp4 decode and the R3M forward entirely.
 
-    When ``backbone`` is ``None``, the encoded features are replaced by the
-    per-frame privileged state vector loaded from each episode's ``state.npy``
-    — a diagnostic mode for training dynamics on simulator state instead of
-    visual features.
+    When ``backbone`` is ``None``, the per-frame privileged state vector
+    loaded from each episode's ``state.npy`` is used instead — diagnostic mode
+    for training dynamics on simulator state directly.
 
-    Returns the number of transitions added. The caller is responsible for
-    calling ``buffer.pin_current_contents()`` after this if expert data should
-    survive subsequent eviction.
+    Returns the total number of transitions added across all episodes.
     """
     dataset_dir = Path(dataset_dir)
     records = load_transition_records(dataset_dir)
-    total = sum(int(record.num_actions) for record in records)
-    if total > buffer.capacity:
-        raise ValueError(
-            f"expert dataset has {total} transitions but buffer capacity is "
-            f"{buffer.capacity}; allocate a larger buffer before seeding"
-        )
     use_privileged_state = backbone is None
     cache_dir = (
         dataset_dir / "encoded" / _backbone_cache_key(backbone)
@@ -123,18 +115,18 @@ def seed_buffer_with_expert(
             )
             if cache_path is not None and cache_path.exists():
                 cache_hits += 1
-        num_pairs = min(features.shape[0] - 1, actions.shape[0], proprio.shape[0] - 1)
-        if num_pairs < 1:
+        # Episode has T transitions => T+1 states. Trim all three streams to
+        # the longest common prefix so they line up.
+        T = min(features.shape[0] - 1, actions.shape[0], proprio.shape[0] - 1)
+        if T < 1:
             continue
-        for i in range(num_pairs):
-            buffer.add(
-                features[i],
-                proprio[i],
-                actions[i],
-                features[i + 1],
-                proprio[i + 1],
-            )
-            added += 1
+        store.add_episode(
+            visual=features[: T + 1],
+            proprio=proprio[: T + 1],
+            action=actions[:T],
+            pinned=pinned,
+        )
+        added += T
         progress.set_postfix(transitions=added, cached=cache_hits)
     return added
 

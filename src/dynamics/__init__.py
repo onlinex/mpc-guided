@@ -1,14 +1,17 @@
 """Reusable forward dynamics components."""
 
-from src.dynamics.buffer import DynamicsBatch, TransitionReplayBuffer
+from src.dynamics.episode_store import Episode, EpisodeStore, WindowBatch
 from src.dynamics.model import ForwardDynamicsConfig, ForwardDynamicsModel
+from src.dynamics.rollout_accumulator import RolloutAccumulator
 from src.dynamics.training import DynamicsTrainer, DynamicsTrainerConfig
 
 __all__ = [
-    "DynamicsBatch",
     "DynamicsTrainer",
     "DynamicsTrainerConfig",
+    "Episode",
+    "EpisodeStore",
     "ForwardDynamicsConfig",
     "ForwardDynamicsModel",
-    "TransitionReplayBuffer",
+    "RolloutAccumulator",
+    "WindowBatch",
 ]
