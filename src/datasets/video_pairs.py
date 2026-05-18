@@ -49,7 +49,7 @@ class VideoFramePairSampler:
         max_gap: int,
         cache_size: int = 8,
         pairs_per_video: int = 1,
-        seed: int = 0,
+        seed: int = 42,
     ) -> None:
         if min_gap < 1:
             raise ValueError(f"min_gap must be >= 1, got {min_gap}")

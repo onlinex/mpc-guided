@@ -31,7 +31,7 @@ class DemoConfig:
     camera_width: int = 224
     camera_height: int = 224
     policy: str = "random"
-    seed: int = 0
+    seed: int = 42
     episodes: int = 5
     max_steps: int = 200
     action_chunk_size: int = 1

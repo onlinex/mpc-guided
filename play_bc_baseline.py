@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sim-backend", default="physx_cpu")
     p.add_argument("--max-episode-steps", type=int, default=100)
     p.add_argument("--episodes", type=int, default=5)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-gui", action="store_true",
                    help="Run without the SAPIEN viewer (just print success/return).")
     p.add_argument("--video-dir", type=Path, default=None,

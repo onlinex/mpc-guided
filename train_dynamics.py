@@ -62,7 +62,7 @@ class TrainDynamicsConfig:
     camera_height: int = 224
     r3m_model_id: str = "resnet18"
     backbone_precision: str = "fp32"
-    seed: int = 0
+    seed: int = 42
     initial_episodes: int = 16
     collection_rounds: int = 40
     episodes_per_round: int = 32

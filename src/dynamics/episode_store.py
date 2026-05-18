@@ -73,7 +73,7 @@ class EpisodeStore:
         visual_dim: int,
         proprio_dim: int,
         action_dim: int,
-        seed: int = 0,
+        seed: int = 42,
     ) -> None:
         if capacity_transitions < 1:
             raise ValueError(f"capacity_transitions must be >= 1, got {capacity_transitions}")

@@ -21,7 +21,7 @@ class OUNoise:
         theta: float,
         stationary_std: float,
         mu: float = 0.0,
-        seed: int = 0,
+        seed: int = 42,
     ) -> None:
         if not 0.0 < theta <= 1.0:
             raise ValueError(f"theta must be in (0, 1], got {theta}")

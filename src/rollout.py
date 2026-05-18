@@ -22,7 +22,7 @@ def rollout(
     *,
     max_steps: int = 200,
     action_chunk_size: int = 1,
-    seed: int = 0,
+    seed: int = 42,
     render: bool = False,
     log_episode: Callable[[int, int, float, bool], None] | None = None,
 ) -> dict:

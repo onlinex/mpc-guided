@@ -45,7 +45,7 @@ class Args:
     batch_size: int = 1024
     lr: float = 3e-4
     normalize_states: bool = False
-    seed: int = 1
+    seed: int = 42
     sim_backend: str = "physx_cpu"
     max_episode_steps: int = 100
     log_freq: int = 1000
