@@ -119,8 +119,9 @@ the gap grows.
 --total-iters          50000
 --batch-size           1024
 --lr                   3e-4
---num-eval-episodes    100        # per eval round
---eval-freq            1000       # train iters between env rollouts
+--rollout-freq         1000       # train iters between rollout/eval rounds
+--num-rollout-episodes 100        # episodes per rollout (feeds online buffer)
+--num-eval-episodes    50         # episodes per eval (deterministic metrics)
 --max-episode-steps    100
 --normalize-states     off        # per-dim zero-mean unit-var input normalization
 --seed                 42

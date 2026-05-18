@@ -77,8 +77,9 @@ class Args:
     sim_backend: str = "physx_cpu"
     max_episode_steps: int = 100
     log_freq: int = 1000
-    eval_freq: int = 1000
-    num_eval_episodes: int = 100
+    rollout_freq: int = 1000
+    num_rollout_episodes: int = 100
+    num_eval_episodes: int = 50
     save_freq: int | None = None
     log_dir: str = "runs/bc"
     run_name: str | None = None
@@ -128,8 +129,24 @@ def parse_args() -> Args:
     p.add_argument("--sim-backend", default=d.sim_backend)
     p.add_argument("--max-episode-steps", type=int, default=d.max_episode_steps)
     p.add_argument("--log-freq", type=int, default=d.log_freq)
-    p.add_argument("--eval-freq", type=int, default=d.eval_freq)
-    p.add_argument("--num-eval-episodes", type=int, default=d.num_eval_episodes)
+    p.add_argument(
+        "--rollout-freq",
+        type=int,
+        default=d.rollout_freq,
+        help="Iterations between rollout/eval passes (both share cadence).",
+    )
+    p.add_argument(
+        "--num-rollout-episodes",
+        type=int,
+        default=d.num_rollout_episodes,
+        help="Episodes per rollout pass (feeds online buffer, no metrics).",
+    )
+    p.add_argument(
+        "--num-eval-episodes",
+        type=int,
+        default=d.num_eval_episodes,
+        help="Episodes per eval pass (deterministic metrics, best-ckpt signal).",
+    )
     p.add_argument("--save-freq", type=int, default=d.save_freq)
     p.add_argument("--log-dir", default=d.log_dir)
     p.add_argument("--run-name", default=d.run_name)
@@ -149,6 +166,47 @@ def parse_args() -> Args:
     return Args(**vars(parsed))
 
 
+def _act(
+    actor: Actor,
+    obs: np.ndarray,
+    *,
+    device: torch.device,
+    obs_mean: np.ndarray,
+    obs_std: np.ndarray,
+) -> np.ndarray:
+    """Greedy action from normalized state. Shared by eval + rollout."""
+    state = (np.asarray(obs, dtype=np.float32).reshape(-1) - obs_mean) / obs_std
+    action = actor(torch.from_numpy(state).to(device).unsqueeze(0))
+    return action.squeeze(0).cpu().numpy().astype(np.float32)
+
+
+def collect_rollouts(
+    *,
+    env: gym.Env,
+    actor: Actor,
+    device: torch.device,
+    num_episodes: int,
+    seed_base: int,
+    obs_mean: np.ndarray,
+    obs_std: np.ndarray,
+    buffer: OnlineBuffer,
+) -> None:
+    """Run greedy rollouts purely to populate the buffer. No metrics."""
+    actor.eval()
+    with torch.no_grad():
+        for i in range(num_episodes):
+            obs, _ = env.reset(seed=seed_base + i)
+            while True:
+                state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
+                action = _act(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
+                obs, _, terminated, truncated, _ = env.step(action)
+                next_state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
+                buffer.add(state_raw, action, next_state_raw)
+                if bool(np.asarray(terminated).reshape(-1)[0]) or bool(np.asarray(truncated).reshape(-1)[0]):
+                    break
+    actor.train()
+
+
 def evaluate(
     *,
     env: gym.Env,
@@ -158,7 +216,6 @@ def evaluate(
     seed_base: int,
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
-    buffer: OnlineBuffer | None = None,
 ) -> dict[str, float]:
     success_once, success_at_end, returns, lengths = [], [], [], []
     actor.eval()
@@ -168,14 +225,8 @@ def evaluate(
             ep_return, once, end, steps = 0.0, False, False, 0
             while True:
                 steps += 1
-                state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
-                state = (state_raw - obs_mean) / obs_std
-                action = actor(torch.from_numpy(state).to(device).unsqueeze(0))
-                action = action.squeeze(0).cpu().numpy().astype(np.float32)
+                action = _act(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
                 obs, reward, terminated, truncated, info = env.step(action)
-                if buffer is not None:
-                    next_state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
-                    buffer.add(state_raw, action, next_state_raw)
                 ep_return += float(np.asarray(reward).reshape(-1)[0])
                 sflag = bool(np.asarray(info.get("success", False)).reshape(-1)[0])
                 once = once or sflag
@@ -333,16 +384,26 @@ def main() -> None:
                 writer.add_scalar("online/buffer_size", len(online_buffer), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
 
-            if iteration % args.eval_freq == 0:
+            if iteration % args.rollout_freq == 0:
+                collect_rollouts(
+                    env=env,
+                    actor=actor,
+                    device=device,
+                    num_episodes=args.num_rollout_episodes,
+                    seed_base=args.seed * 1000 + iteration,
+                    obs_mean=ds.stats.mean,
+                    obs_std=ds.stats.std,
+                    buffer=online_buffer,
+                )
                 metrics = evaluate(
                     env=env,
                     actor=actor,
                     device=device,
                     num_episodes=args.num_eval_episodes,
-                    seed_base=args.seed * 1000 + iteration,
+                    # Offset seeds so eval doesn't reuse rollout episodes.
+                    seed_base=args.seed * 1000 + iteration + 500_000,
                     obs_mean=ds.stats.mean,
                     obs_std=ds.stats.std,
-                    buffer=online_buffer,
                 )
                 for k, v in metrics.items():
                     writer.add_scalar(f"eval/{k}", v, iteration)
