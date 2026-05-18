@@ -68,6 +68,8 @@ class Args:
     batch_size: int = 1024
     lr: float = 3e-4
     normalize_states: bool = False
+    actor_loss_weight: float = 1.0
+    total_loss_weight: float = 0.0
     seed: int = 42
     sim_backend: str = "physx_cpu"
     max_episode_steps: int = 100
@@ -91,6 +93,21 @@ def parse_args() -> Args:
     p.add_argument("--batch-size", type=int, default=d.batch_size)
     p.add_argument("--lr", type=float, default=d.lr)
     p.add_argument("--normalize-states", action=argparse.BooleanOptionalAction, default=d.normalize_states)
+    p.add_argument(
+        "--actor-loss-weight",
+        type=float,
+        default=d.actor_loss_weight,
+        help="Weight on the direct BC actor loss MSE(actor(obs), expert_action). "
+        "Default 1.0. Set to 0 to train the actor PURELY from --total-loss-weight.",
+    )
+    p.add_argument(
+        "--total-loss-weight",
+        type=float,
+        default=d.total_loss_weight,
+        help="Weight on the model-based actor loss "
+        "MSE(forward(obs, actor(obs)), next_obs). 0 = pure BC (default). "
+        "Small values (0.01-0.1) act as model-grounded regularization.",
+    )
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--sim-backend", default=d.sim_backend)
     p.add_argument("--max-episode-steps", type=int, default=d.max_episode_steps)
@@ -102,7 +119,14 @@ def parse_args() -> Args:
     p.add_argument("--run-name", default=d.run_name)
     p.add_argument("--no-cuda", dest="cuda", action="store_false")
     p.set_defaults(cuda=d.cuda)
-    return Args(**vars(p.parse_args()))
+    parsed = p.parse_args()
+    if parsed.actor_loss_weight < 0:
+        p.error("--actor-loss-weight must be >= 0")
+    if parsed.total_loss_weight < 0:
+        p.error("--total-loss-weight must be >= 0")
+    if parsed.actor_loss_weight == 0 and parsed.total_loss_weight == 0:
+        p.error("at least one of --actor-loss-weight or --total-loss-weight must be > 0")
+    return Args(**vars(parsed))
 
 
 def evaluate(
@@ -217,29 +241,41 @@ def main() -> None:
 
     best_eval = defaultdict(float)
     try:
+        w_a = args.actor_loss_weight
+        w_t = args.total_loss_weight
         for iteration, batch in enumerate(
             tqdm(dataloader, total=args.total_iters, desc="bc/train")
         ):
             obs, action, next_obs = batch
 
-            # Actor update.
-            pred = actor(obs)
-            loss = F.mse_loss(pred, action)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # Forward-model update (independent optimizer; gradients can't leak
-            # into the actor since obs/action are leaf tensors here).
+            # 1. Forward-model update — always direct MSE on expert action.
+            #    Done first so the actor's joint loss can use the freshest forward.
+            forward_optimizer.zero_grad()
             pred_next = forward_model(obs, action)
             fwd_loss = F.mse_loss(pred_next, next_obs)
-            forward_optimizer.zero_grad()
             fwd_loss.backward()
             forward_optimizer.step()
 
+            # 2. Actor update: w_a * actor_loss + w_t * total_loss.
+            #    Either weight may be 0 (validated in parse_args so not both).
+            #    Joint backward accumulates grads on forward when w_t>0; those
+            #    are discarded next iter via forward_optimizer.zero_grad().
+            optimizer.zero_grad()
+            pred = actor(obs)
+            actor_loss = F.mse_loss(pred, action)
+            if w_t > 0:
+                total_loss = F.mse_loss(forward_model(obs, actor(obs)), next_obs)
+            else:
+                with torch.no_grad():
+                    total_loss = F.mse_loss(forward_model(obs, actor(obs)), next_obs)
+            joint_loss = w_a * actor_loss + w_t * total_loss
+            joint_loss.backward()
+            optimizer.step()
+
             if iteration % args.log_freq == 0:
-                writer.add_scalar("losses/actor_loss", float(loss.detach().cpu()), iteration)
+                writer.add_scalar("losses/actor_loss", float(actor_loss.detach().cpu()), iteration)
                 writer.add_scalar("losses/dynamics_loss", float(fwd_loss.detach().cpu()), iteration)
+                writer.add_scalar("losses/total_loss", float(total_loss.detach().cpu()), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
 
             if iteration % args.eval_freq == 0:
@@ -255,7 +291,7 @@ def main() -> None:
                 for k, v in metrics.items():
                     writer.add_scalar(f"eval/{k}", v, iteration)
                 print(
-                    f"iter={iteration} loss={float(loss):.4f} "
+                    f"iter={iteration} actor_loss={float(actor_loss):.4f} "
                     f"success_once={metrics['success_once']:.3f} "
                     f"success_at_end={metrics['success_at_end']:.3f} "
                     f"return={metrics['episode_return']:.2f}"

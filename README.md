@@ -1,156 +1,185 @@
 # mpc-control
 
-Goal-state behavior cloning with learned forward dynamics on ManiSkill PickCube.
+State-based behavior cloning on ManiSkill PickCube, with an optional jointly-trained
+forward dynamics model that can be mixed into the actor's loss for model-grounded
+regularization (or used as the sole training signal).
 
-The actor is trained by rolling forward through a learned `ForwardDynamicsModel`
-for K steps and matching the predicted state at step K to a goal frame sampled
-from expert demonstrations.
+Two parallel BC entrypoints:
 
-## Local Smoke Rollout
+- **[train_bc_baseline.py](train_bc_baseline.py)** — byte-equivalent port of the
+  upstream ManiSkill state-based BC baseline (`examples/baselines/bc/bc.py`). Reads
+  the monolithic h5 produced by `replay_trajectory`. Use this when you want a
+  strict reference against the published number.
+- **[train_bc.py](train_bc.py)** — same numerics (256x256 ReLU MLP, single-action
+  MSE, Adam lr 3e-4, batch 1024) but reads our per-episode dataset format produced
+  by `build_dataset.py`. Adds an independently-trained `ForwardModel` and exposes
+  `--actor-loss-weight` / `--total-loss-weight` to ablate direct vs model-based
+  actor losses.
+
+## Quick start
 
 ```bash
 uv sync
-uv run python demo.py --episodes 1 --max-steps 50
-```
 
-Play back a trained checkpoint:
-
-```bash
-uv run python demo.py --checkpoint runs/dynamics/<RUN>/actor.pt --episodes 3
-```
-
-`--checkpoint` forces `--obs-mode rgb`, builds the R3M backbone, and runs the
-actor's deterministic mean. Pass `--stochastic` to add AR(1)/OU exploration
-noise on top.
-
-Note: `demo.py` currently assumes an R3M-trained checkpoint. Loading a
-`--use-privileged-state` checkpoint via `demo.py` is not yet wired.
-
-## Expert Video Dataset
-
-Source demos must already be in the target control mode. PickCube
-motionplanning demos ship in `pd_joint_pos` — convert to `pd_joint_delta_pos`
-first:
-
-```bash
+# 1. Download RL demos (one-time).
 uv run python -m mani_skill.utils.download_demo PickCube-v1
+
+# 2. Convert to state obs + pd_joint_delta_pos control (drops a new h5 next to source).
 uv run python -m mani_skill.trajectory.replay_trajectory \
-  --traj-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.h5 \
-  --target-control-mode pd_joint_delta_pos --save-traj --use-env-states
+  --traj-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.none.pd_joint_delta_pos.physx_cuda.h5 \
+  --use-first-env-state -c pd_joint_delta_pos -o state \
+  --save-traj -b physx_cpu -n 10
+
+# 3a. Run the strict upstream baseline (h5 in, eval rollouts out).
+uv run python train_bc_baseline.py \
+  --demo-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
+  --total-iters 50000 --run-name pickcube-bc-baseline
+
+# 3b. OR: build our per-episode dataset, train on that.
+uv run python build_dataset.py \
+  --source-h5 ~/.maniskill/demos/PickCube-v1/rl/trajectory.none.pd_joint_delta_pos.physx_cuda.h5 \
+  --output-dir data/pickcube_rl
+uv run python train_bc.py \
+  --dataset-dir data/pickcube_rl \
+  --total-iters 50000 --run-name pickcube-bc-perepisode
 ```
 
-Then build our derived dataset:
+State-based BC on RL demos reaches `eval/success_at_end` ≈ 0.8 within 50k iters on
+PickCube. The two scripts produce comparable curves.
 
-```bash
-uv run python build_pickcube_video_dataset.py
-```
+## Dataset format
 
-This replays each episode by stepping the env with the H5's stored actions
-(matching control mode is validated at build time) and writes per-episode:
+`build_dataset.py` accepts any ManiSkill `trajectory.h5` and writes per-episode
+files:
 
 ```text
-data/pickcube_expert_videos/
-  videos/episode_NNNNNN.mp4        # base_camera RGB
-  actions/episode_NNNNNN.npy       # (T, action_dim)  pd_joint_delta_pos
-  proprio/episode_NNNNNN.npy       # (T+1, 18) qpos + qvel
-  state/episode_NNNNNN.npy         # (T+1, 29) privileged state (agent + extra)
-  manifest.jsonl
-  metadata.json
+data/<tag>/
+  state/episode_NNNNNN.npy     # (T+1, state_dim)   env's obs_mode=state vector
+  actions/episode_NNNNNN.npy   # (T,   action_dim)  source h5 actions, verbatim
+  proprio/episode_NNNNNN.npy   # (T+1, proprio_dim) qpos + qvel
+  videos/episode_NNNNNN.mp4    # optional, --include-video
+  manifest.jsonl               # one json object per episode (paths + dims)
+  metadata.json                # env_id, control_mode, dims, source, has_video
 ```
 
-Because we step actions in the same env an actor will be evaluated in, the
-dataset is provably faithful — verified by `tests/test_expert_action_replay.py`.
+The build is two-pass: state/actions/proprio always; rgb video only with
+`--include-video` (~2x slower). Source h5's `control_mode` must match `--control-mode`
+(default `pd_joint_delta_pos`).
 
-## Training
+Faithfulness check: [tests/test_dataset_replay.py](tests/test_dataset_replay.py)
+replays episode 0 through a fresh env from the saved `env_state` and asserts the
+state trajectory matches the saved `state.npy` within 1e-4.
 
-```bash
-uv run python train_dynamics.py --run-name my-run
+Static validation: [tests/test_dataset_validity.py](tests/test_dataset_validity.py)
+checks manifest/metadata schemas, per-episode shapes/dtypes/finiteness across
+all episodes, and video content sanity (channel balance, cross-pixel and
+cross-frame variance) — catches the all-green or solid-color rendering class
+of bugs.
+
+## Actor + ForwardModel
+
+[src/actor/](src/actor/) is the active code path. Two minimal modules:
+
+- `Actor`: `state_dim → 256 → ReLU → 256 → ReLU → action_dim`. Raw linear output,
+  no squashing — matches the upstream baseline.
+- `ForwardModel`: `(state, action) → 256 → ReLU → 256 → ReLU → state_dim`.
+
+Both are pure MLPs. The forward model is trained alongside the actor on the same
+per-episode data with its own optimizer, so by default it has zero influence on
+the actor (gradients can't leak across optimizers).
+
+### Joint actor loss
+
+`train_bc.py` computes three losses per iteration:
+
+- `losses/actor_loss`  = `MSE(actor(obs), expert_action)`
+- `losses/dynamics_loss` = `MSE(forward(obs, expert_action), next_obs)` (trains forward)
+- `losses/total_loss` = `MSE(forward(obs, actor(obs)), next_obs)` (couples actor→forward→state)
+
+The actor is trained on a weighted combination:
+
+```
+actor_step_loss = actor_loss_weight * actor_loss + total_loss_weight * total_loss
 ```
 
-Per round, the trainer:
-
-1. **Collect** episodes in the env using the current actor (+ optional OU noise).
-2. **Dynamics phase** — `--train-steps-per-round` gradient steps against the buffer.
-3. **Actor phase** — `--actor-train-steps-per-round` updates against the
-   just-trained dynamics. Each step samples (start, goal) expert frame pairs,
-   rolls actor through dynamics for gap K, and minimizes MSE between predicted
-   visual at step K and the goal visual.
-4. **Checkpoint** `actor_latest.pt`.
-
-### Privileged-state mode
-
-The `--use-privileged-state` flag bypasses the R3M backbone entirely and feeds
-the simulator's flat `agent + extra` state vector as the "visual" stream. Used
-for diagnostic experiments to isolate dynamics-learning issues from visual-
-encoding issues. Requires `state.npy` in the dataset (already saved by the
-build script above).
-
-```bash
-uv run python train_dynamics.py --use-privileged-state
-```
-
-### BC mode for the actor
-
-`--actor-bc-mode` switches the actor training step from goal-state-via-dynamics
-to direct behavior cloning: MSE between `actor(state, proprio)` and the H5
-action label, sampled from the replay buffer. Dynamics is irrelevant in this
-mode and can be skipped with `--pretrain-dynamics-steps 0 --train-steps-per-round 0`.
-
-Optional `--actor-bc-input-noise <std>` adds Gaussian noise to inputs during
-BC training (DART-style augmentation against closed-loop covariate shift).
-
-### Key flags
-
-| Flag | Default | Notes |
+| `--actor-loss-weight` | `--total-loss-weight` | Behavior |
 |---|---|---|
-| `--hidden-dims` | `512,512` | Dynamics MLP hidden sizes |
-| `--actor-hidden-dims` | `256,256` | Actor MLP hidden sizes |
-| `--buffer-capacity` | `200000` | On-policy slots; expert transitions are added on top and pinned |
-| `--pretrain-dynamics-steps` | `10000` | One-shot dynamics pretrain on seeded expert before collection rounds start |
-| `--train-steps-per-round` | `50` | In-loop dynamics steps per round; `0` freezes dynamics after pretrain |
-| `--actor-train-steps-per-round` | `30` | Actor steps per round |
-| `--actor-pair-min-gap` / `--actor-pair-max-gap` | `1` / `5` | Rollout horizon range (goal-state actor) |
-| `--exploration-ou-std` | `0.0` | AR(1)/OU noise std added during env collection; `0` = deterministic |
-| `--use-privileged-state` | off | Skip R3M; use simulator state as visual stream |
-| `--actor-bc-mode` | off | Direct BC instead of dynamics rollout for the actor |
-| `--seed-buffer-with-expert` | on | Encode every expert transition into the buffer at startup |
-| `--pin-expert-in-buffer` | on | Pinned entries are never evicted |
+| `1.0` (default) | `0.0` (default) | Pure BC. ForwardModel still trains but doesn't influence actor. `total_loss` logged as diagnostic. |
+| `1.0` | `> 0` | Joint: direct BC + model-grounded regularization. Robust on PickCube; on this dataset `1.0`/`5.0` train as well as pure BC. |
+| `0.0` | `> 0` | Pure model-based imitation. Actor only sees expert states; learns to produce actions that the (jointly-trained) forward model maps onto expert next states. On PickCube reaches comparable final reward to direct BC, slightly worse actor_loss along the way. |
 
-### TensorBoard
+`total_loss - dynamics_loss` is a useful compounding-error diagnostic: with the
+actor in-distribution it's small; if the actor drifts off-policy w.r.t. forward
+the gap grows.
 
-```bash
-uv run tensorboard --logdir runs
+### Other flags
+
+```text
+--dataset-dir          data/pickcube_rl
+--total-iters          50000
+--batch-size           1024
+--lr                   3e-4
+--num-eval-episodes    100        # per eval round
+--eval-freq            1000       # train iters between env rollouts
+--max-episode-steps    100
+--normalize-states     off        # per-dim zero-mean unit-var input normalization
+--seed                 42
 ```
 
-Key groups:
+## Eval / playback
 
-- `dynamics/*` — train/eval losses, `visual_identity_loss_ratio` (model loss /
-  identity-baseline loss; <1 means it beats predicting "no change"), plus
-  per-source breakdown: `visual_identity_loss_ratio_expert` and
-  `..._on_policy` (lets you tell whether dynamics is forgetting the expert
-  region vs failing to fit the on-policy region).
-- `actor/*` — actor loss (goal-state MSE in rollout mode, action MSE in BC
-  mode), grad norm, action magnitude.
-- `rollout/*` — env return, success, action magnitude, exploration noise mean,
-  `action_within_episode_std` (low = near-open-loop).
-- `replay_buffer/*` — size, pinned count, expert seeded count.
+```bash
+uv run python play_bc_baseline.py \
+  --checkpoint runs/bc/<RUN>/checkpoints/best_eval_success_at_end.pt \
+  --episodes 5
+```
+
+Opens the SAPIEN viewer (macOS uses MoltenVK). Pass `--no-gui` for headless or
+`--video-dir <path>` to save mp4s via `RecordEpisode`. Loads checkpoints from both
+`train_bc_baseline.py` and `train_bc.py` (they share the actor format).
 
 ## Tests
 
 ```bash
-uv run pytest -m "not env"                              # fast unit tests, ~2s
-uv run pytest                                           # full suite incl. env-dependent
-uv run pytest tests/test_expert_action_replay.py        # data pipeline integrity
+uv run pytest -m "not env"                  # fast unit tests, ~5s
+uv run pytest -m "dataset"                  # static dataset validation (needs build)
+uv run pytest -m "env and dataset"          # slow replay-through-env tests
+uv run pytest                               # everything
 ```
 
-Markers:
-- `env` — requires a live ManiSkill env (slow).
-- `dataset` — requires the built expert video dataset on disk (auto-skipped otherwise).
+Markers (declared in [pyproject.toml](pyproject.toml)):
 
-The `expert_action_replay` test re-steps each episode's actions through a
-freshly built env and asserts the recorded success and qpos trajectory are
-reproduced exactly. If this test fails, the dataset is no longer trustworthy
-and downstream training will be broken in ways that are hard to debug.
+- `env` — constructs a ManiSkill env (seconds of import + reset time).
+- `dataset` — reads from `data/pickcube_rl/`; auto-skipped if not built.
+
+## Repo layout
+
+Active:
+
+```text
+src/
+  actor/      Actor + ForwardModel (the current BC stack)
+  bc/         StateBCDataset (loads per-episode dataset)
+  datasets/   builder.py for dataset construction
+  backbone.py / networks.py / observations.py / rollout.py / utils.py
+train_bc.py             Per-episode-format BC trainer with joint actor+dynamics loss
+train_bc_baseline.py    H5-format upstream-equivalent BC trainer
+build_dataset.py        Per-episode dataset builder
+play_bc_baseline.py     Checkpoint replay (SAPIEN GUI or mp4)
+```
+
+Parked (kept for later, not on the BC path):
+
+```text
+src/dynamics/       Episode-keyed replay store + ForwardDynamicsModel + multi-step trainer
+src/legacy/actor/   Chunked + tanh-squashed Actor with goal-state VideoActorTrainer
+train_dynamics.py   Old goal-state-via-dynamics training loop
+demo.py             Uses legacy actor checkpoints
+```
+
+The parked code is functional and tested but isn't imported by `train_bc*.py`.
+The dynamics path is worth revisiting if/when the BC baseline is locked down
+and we want to layer planning or multi-step world-model training on top.
 
 ## dstack
 
