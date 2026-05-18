@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 from src.actor import Actor, ForwardModel
 from src.bc import StateBCDataset
+from src.buffer import OnlineBuffer
 
 
 class IterationBasedBatchSampler(BatchSampler):
@@ -70,6 +71,8 @@ class Args:
     normalize_states: bool = False
     actor_loss_weight: float = 0.0
     total_loss_weight: float = 1.0
+    online_buffer_size: int = 100_000
+    online_mix_ratio: float = 0.5
     seed: int = 42
     sim_backend: str = "physx_cpu"
     max_episode_steps: int = 100
@@ -108,6 +111,19 @@ def parse_args() -> Args:
         "MSE(forward(obs, actor(obs)), next_obs). Default 1.0 (pure model-based). "
         "Set to 0 with --actor-loss-weight 1 for pure BC.",
     )
+    p.add_argument(
+        "--online-buffer-size",
+        type=int,
+        default=d.online_buffer_size,
+        help="Capacity (transitions) of the FIFO buffer fed by eval rollouts.",
+    )
+    p.add_argument(
+        "--online-mix-ratio",
+        type=float,
+        default=d.online_mix_ratio,
+        help="Fraction of the dynamics-step batch sampled from the online buffer. "
+        "0 = pure BC dynamics training (default). Clamped by buffer size early on.",
+    )
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--sim-backend", default=d.sim_backend)
     p.add_argument("--max-episode-steps", type=int, default=d.max_episode_steps)
@@ -126,6 +142,10 @@ def parse_args() -> Args:
         p.error("--total-loss-weight must be >= 0")
     if parsed.actor_loss_weight == 0 and parsed.total_loss_weight == 0:
         p.error("at least one of --actor-loss-weight or --total-loss-weight must be > 0")
+    if parsed.online_buffer_size < 1:
+        p.error("--online-buffer-size must be >= 1")
+    if not 0.0 <= parsed.online_mix_ratio <= 1.0:
+        p.error("--online-mix-ratio must be in [0, 1]")
     return Args(**vars(parsed))
 
 
@@ -138,6 +158,7 @@ def evaluate(
     seed_base: int,
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
+    buffer: OnlineBuffer | None = None,
 ) -> dict[str, float]:
     success_once, success_at_end, returns, lengths = [], [], [], []
     actor.eval()
@@ -147,11 +168,14 @@ def evaluate(
             ep_return, once, end, steps = 0.0, False, False, 0
             while True:
                 steps += 1
-                state = np.asarray(obs, dtype=np.float32).reshape(-1)
-                state = (state - obs_mean) / obs_std
+                state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
+                state = (state_raw - obs_mean) / obs_std
                 action = actor(torch.from_numpy(state).to(device).unsqueeze(0))
                 action = action.squeeze(0).cpu().numpy().astype(np.float32)
                 obs, reward, terminated, truncated, info = env.step(action)
+                if buffer is not None:
+                    next_state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
+                    buffer.add(state_raw, action, next_state_raw)
                 ep_return += float(np.asarray(reward).reshape(-1)[0])
                 sflag = bool(np.asarray(info.get("success", False)).reshape(-1)[0])
                 once = once or sflag
@@ -235,6 +259,15 @@ def main() -> None:
     optimizer = optim.Adam(actor.parameters(), lr=args.lr)
     forward_model = ForwardModel(ds.state_dim, ds.action_dim).to(device)
     forward_optimizer = optim.Adam(forward_model.parameters(), lr=args.lr)
+
+    online_buffer = OnlineBuffer(
+        capacity=args.online_buffer_size,
+        state_dim=ds.state_dim,
+        action_dim=ds.action_dim,
+    )
+    buffer_rng = np.random.default_rng(args.seed)
+    obs_mean_t = torch.from_numpy(ds.stats.mean.astype(np.float32)).to(device)
+    obs_std_t = torch.from_numpy(ds.stats.std.astype(np.float32)).to(device)
     print(f"Device: {device} | run_dir: {run_dir}")
     print(f"Actor params: {sum(p.numel() for p in actor.parameters())}")
     print(f"ForwardModel params: {sum(p.numel() for p in forward_model.parameters())}")
@@ -248,11 +281,28 @@ def main() -> None:
         ):
             obs, action, next_obs = batch
 
-            # 1. Forward-model update — always direct MSE on expert action.
+            # 1. Forward-model update — direct MSE on expert action, optionally
+            #    mixed with on-policy transitions collected during eval.
             #    Done first so the actor's joint loss can use the freshest forward.
+            k = min(int(args.batch_size * args.online_mix_ratio), len(online_buffer))
+            n_bc = args.batch_size - k
             forward_optimizer.zero_grad()
-            pred_next = forward_model(obs, action)
-            fwd_loss = F.mse_loss(pred_next, next_obs)
+            if n_bc > 0:
+                fwd_loss_bc = F.mse_loss(forward_model(obs[:n_bc], action[:n_bc]), next_obs[:n_bc])
+            else:
+                fwd_loss_bc = None
+            if k > 0:
+                on_s, on_a, on_ns = online_buffer.sample(k, buffer_rng)
+                on_s_t = (torch.from_numpy(on_s).to(device) - obs_mean_t) / obs_std_t
+                on_ns_t = (torch.from_numpy(on_ns).to(device) - obs_mean_t) / obs_std_t
+                on_a_t = torch.from_numpy(on_a).to(device)
+                fwd_loss_on = F.mse_loss(forward_model(on_s_t, on_a_t), on_ns_t)
+            else:
+                fwd_loss_on = None
+            if fwd_loss_bc is not None and fwd_loss_on is not None:
+                fwd_loss = (n_bc * fwd_loss_bc + k * fwd_loss_on) / args.batch_size
+            else:
+                fwd_loss = fwd_loss_bc if fwd_loss_on is None else fwd_loss_on
             fwd_loss.backward()
             forward_optimizer.step()
 
@@ -275,7 +325,12 @@ def main() -> None:
             if iteration % args.log_freq == 0:
                 writer.add_scalar("losses/actor_loss", float(actor_loss.detach().cpu()), iteration)
                 writer.add_scalar("losses/dynamics_loss", float(fwd_loss.detach().cpu()), iteration)
+                if fwd_loss_bc is not None:
+                    writer.add_scalar("losses/dynamics_loss_bc", float(fwd_loss_bc.detach().cpu()), iteration)
+                if fwd_loss_on is not None:
+                    writer.add_scalar("losses/dynamics_loss_online", float(fwd_loss_on.detach().cpu()), iteration)
                 writer.add_scalar("losses/total_loss", float(total_loss.detach().cpu()), iteration)
+                writer.add_scalar("online/buffer_size", len(online_buffer), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
 
             if iteration % args.eval_freq == 0:
@@ -287,6 +342,7 @@ def main() -> None:
                     seed_base=args.seed * 1000 + iteration,
                     obs_mean=ds.stats.mean,
                     obs_std=ds.stats.std,
+                    buffer=online_buffer,
                 )
                 for k, v in metrics.items():
                     writer.add_scalar(f"eval/{k}", v, iteration)
