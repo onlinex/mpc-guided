@@ -1,8 +1,9 @@
 """Forward dynamics model with a self-modeling surprise head.
 
 Shared trunk, two heads:
-- ``state_head``: predicts next state from (state, action) — the dynamics signal
-  that trains the trunk + state_head and drives the actor's H-step rollout.
+- ``state_head``: predicts next state from (state, action) — the dynamics
+  signal that trains the trunk + state_head and drives the actor's H-step
+  rollout.
 - ``surprise_head``: a non-negative scalar (softplus) estimating the per-sample
   L2 prediction error of ``state_head``. Trained against the detached actual
   MSE; the trunk's hidden activation is detached before the surprise head, so
@@ -26,12 +27,14 @@ import torch.nn.functional as F
 class ForwardModel(nn.Module):
     """``(state, action) -> (next_state, surprise)``.
 
-    Trunk is 2x256 ReLU. ``state_head`` is a raw linear to ``state_dim``;
-    ``surprise_head`` is a single softplus scalar — non-negative estimate of
-    the per-sample L2 prediction error in real units.
+    Trunk is a single ``hidden``-wide layer; ``state_head`` is a 2-layer MLP
+    (so most of the predictive capacity lives in the specialized head, not
+    the shared encoder); ``surprise_head`` is a softplus scalar from a
+    2-layer MLP — non-negative estimate of the per-sample L2 prediction
+    error in real units.
 
     ``surprise_momentum`` is the EMA "new weight" (so effective averaging window
-    is ~``1 / momentum`` updates). Default 1e-4 → settles on the last ~10k
+    is ~``1 / momentum`` updates). Default 1e-3 → settles on the last ~1k
     dynamics-step updates.
     """
 
@@ -40,7 +43,7 @@ class ForwardModel(nn.Module):
         state_dim: int,
         action_dim: int,
         hidden: int = 256,
-        surprise_momentum: float = 1e-4,
+        surprise_momentum: float = 1e-3,
     ) -> None:
         super().__init__()
         self.state_dim = state_dim
@@ -49,11 +52,20 @@ class ForwardModel(nn.Module):
         self.trunk = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden),
             nn.ReLU(),
+        )
+        # 2-layer head holds the bulk of next-state prediction capacity,
+        # rather than burying it in a wide shared trunk that the surprise
+        # head can't read into (h is detached before the surprise head).
+        self.state_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, state_dim),
         )
-        self.state_head = nn.Linear(hidden, state_dim)
-        self.surprise_head = nn.Linear(hidden, 1)
+        self.surprise_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
         # EMA of actual per-sample MSE and its second moment. Init to (0, 1)
         # so an untrained model normalizes to ~sigmoid(actual) until the EMA
         # warms up over the first few thousand updates.
@@ -61,11 +73,23 @@ class ForwardModel(nn.Module):
         self.register_buffer("surprise_sq_mean", torch.ones(()))
 
     def forward(
-        self, state: torch.Tensor, action: torch.Tensor
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        *,
+        detach_surprise: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``detach_surprise=True`` (default) cuts the gradient path from the
+        surprise output back through the trunk — used during the dynamics step
+        so the head's loss can't tug the predictor. Pass ``False`` from the
+        actor rollout if you want surprise to be a *signal the actor can
+        optimize through* (e.g., maximize-surprise regularizer); the path then
+        becomes ``surprise -> trunk -> action -> actor params``.
+        """
         h = self.trunk(torch.cat([state, action], dim=-1))
         next_state = self.state_head(h)
-        surprise = F.softplus(self.surprise_head(h.detach())).squeeze(-1)
+        h_for_surp = h.detach() if detach_surprise else h
+        surprise = F.softplus(self.surprise_head(h_for_surp)).squeeze(-1)
         return next_state, surprise
 
     @torch.no_grad()

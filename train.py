@@ -72,6 +72,7 @@ class Args:
     actor_loss_weight: float = 0.0
     total_loss_weight: float = 1.0
     actor_horizon: int = 1
+    actor_surprise_coef: float = 0.0
     online_buffer_size: int = 300_000
     online_mix_ratio: float = 0.95
     explore_sigma: float = 0.0
@@ -113,6 +114,18 @@ def parse_args() -> Args:
         help="Weight on the model-based actor loss "
         "MSE(forward(obs, actor(obs)), next_obs). Default 1.0 (pure model-based). "
         "Set to 0 with --actor-loss-weight 1 for pure BC.",
+    )
+    p.add_argument(
+        "--actor-surprise-coef",
+        type=float,
+        default=d.actor_surprise_coef,
+        help="Subtract coef * std(normalize_actual(rollout_surprise)) from the "
+        "actor's joint loss so the actor is rewarded for producing a DIVERSE "
+        "(not just high) surprise distribution across the batch — avoids mode "
+        "collapse where the actor picks one high-surprise trick everywhere. "
+        "0 (default) = off. Only active when --total-loss-weight > 0 (needs the "
+        "model-based gradient path). Start small (0.01-0.05) — competes with "
+        "the imitation objective.",
     )
     p.add_argument(
         "--actor-horizon",
@@ -187,6 +200,13 @@ def parse_args() -> Args:
         p.error("--explore-sigma must be >= 0")
     if parsed.actor_horizon < 1:
         p.error("--actor-horizon must be >= 1")
+    if parsed.actor_surprise_coef < 0:
+        p.error("--actor-surprise-coef must be >= 0")
+    if parsed.actor_surprise_coef > 0 and parsed.total_loss_weight == 0:
+        p.error(
+            "--actor-surprise-coef requires --total-loss-weight > 0 "
+            "(surprise gradient flows through the model-based rollout)"
+        )
     return Args(**vars(parsed))
 
 
@@ -407,6 +427,10 @@ def main() -> None:
             else:
                 fwd_loss, surp_loss = fwd_loss_on, surp_loss_on
                 actual_combined = actual_surp_on
+            # RMSE on the surprise head: the sqrt scales gradients by
+            # 1/(2*sqrt(MSE)), which amplifies updates when surprise targets
+            # are tiny — useful here since per-sample dynamics errors are small.
+            surp_loss = surp_loss.clamp_min(1e-12).sqrt()
             (fwd_loss + surp_loss).backward()
             forward_optimizer.step()
             # EMA tracks the same BC+online mixture the dynamics is trained on
@@ -428,11 +452,19 @@ def main() -> None:
             # Keep full (B,) per step so we can log distribution (histogram +
             # percentiles), not just the batch mean.
             rollout_surprise: list[torch.Tensor] = []
+            # When coef>0, also keep grad-tracking surprise (forward called with
+            # detach_surprise=False) so the actor can optimize through it.
+            rollout_surprise_grad: list[torch.Tensor] = []
+            actor_pull_term = None
             if w_t > 0:
                 s = obs
                 for _ in range(H):
-                    s, ps = forward_model(s, actor(s))
+                    s, ps = forward_model(
+                        s, actor(s), detach_surprise=(args.actor_surprise_coef == 0)
+                    )
                     rollout_surprise.append(ps.detach())
+                    if args.actor_surprise_coef > 0:
+                        rollout_surprise_grad.append(ps)
                 total_loss = F.mse_loss(s, goal_obs)
             else:
                 with torch.no_grad():
@@ -442,6 +474,15 @@ def main() -> None:
                         rollout_surprise.append(ps)
                     total_loss = F.mse_loss(s, goal_obs)
             joint_loss = w_a * actor_loss + w_t * total_loss
+            if rollout_surprise_grad:
+                # Maximize across-batch std of normalized surprise → subtract
+                # from joint_loss. Rewards diversity (different states drive
+                # different surprise levels), not magnitude.
+                stacked = forward_model.normalize_actual(
+                    torch.stack(rollout_surprise_grad)
+                )  # (H, B)
+                actor_pull_term = args.actor_surprise_coef * stacked.std(dim=1).mean()
+                joint_loss = joint_loss - actor_pull_term
             joint_loss.backward()
             optimizer.step()
             forward_model.requires_grad_(True)
@@ -457,6 +498,12 @@ def main() -> None:
                 writer.add_scalar("online/buffer_size", len(online_buffer), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
                 writer.add_scalar("surprise/head_loss", float(surp_loss.detach().cpu()), iteration)
+                if actor_pull_term is not None:
+                    writer.add_scalar(
+                        "surprise/actor_pull",
+                        float(actor_pull_term.detach().cpu()),
+                        iteration,
+                    )
                 if rollout_surprise:
                     # (H, B) raw -> (H, B) normalized in [0, 1]. Log batch
                     # mean and the full distribution per step.
