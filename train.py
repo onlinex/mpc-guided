@@ -72,6 +72,7 @@ class Args:
     actor_loss_weight: float = 0.0
     total_loss_weight: float = 1.0
     actor_horizon: int = 1
+    action_chunk: int = 1
     actor_surprise_coef: float = 0.0
     online_buffer_size: int = 300_000
     online_mix_ratio: float = 0.95
@@ -131,11 +132,19 @@ def parse_args() -> Args:
         "--actor-horizon",
         type=int,
         default=d.actor_horizon,
-        help="Number of forward-model steps the actor rolls out before comparing "
-        "to the goal state. H=1 (default) is single-step (byte-equivalent to the "
-        "old behavior); H>1 uses MSE(forward^H(obs, actor), state_{t+H}) so the "
-        "actor must find an action sequence that lands on the H-step-ahead expert "
-        "state. Dynamics still trains 1-step.",
+        help="Number of forward-model rollouts the actor performs. Each rollout "
+        "advances by --action-chunk env steps, so total env-step lookahead is "
+        "H * N. H=1 (default) is single-rollout; H>1 stacks H queries to the "
+        "actor and H invocations of the forward model.",
+    )
+    p.add_argument(
+        "--action-chunk",
+        type=int,
+        default=d.action_chunk,
+        help="Actions per actor query (N). The actor emits N actions per call; "
+        "the forward model predicts the state N env steps after the chunk is "
+        "executed open-loop; the env executes the chunk one action at a time "
+        "before re-querying. N=1 (default) collapses to per-step prediction.",
     )
     p.add_argument(
         "--online-buffer-size",
@@ -200,6 +209,8 @@ def parse_args() -> Args:
         p.error("--explore-sigma must be >= 0")
     if parsed.actor_horizon < 1:
         p.error("--actor-horizon must be >= 1")
+    if parsed.action_chunk < 1:
+        p.error("--action-chunk must be >= 1")
     if parsed.actor_surprise_coef < 0:
         p.error("--actor-surprise-coef must be >= 0")
     if parsed.actor_surprise_coef > 0 and parsed.total_loss_weight == 0:
@@ -210,7 +221,7 @@ def parse_args() -> Args:
     return Args(**vars(parsed))
 
 
-def _act(
+def _act_chunk(
     actor: Actor,
     obs: np.ndarray,
     *,
@@ -218,10 +229,15 @@ def _act(
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
 ) -> np.ndarray:
-    """Greedy action from normalized state. Shared by eval + rollout."""
+    """Greedy action *chunk* from normalized state. Shape ``(chunk_size, action_dim)``.
+
+    Env rollouts execute the chunk open-loop and re-query on exhaustion — so
+    a chunked actor commits to a short action sequence per query, matching
+    the H-step open-loop rollout used during training.
+    """
     state = (np.asarray(obs, dtype=np.float32).reshape(-1) - obs_mean) / obs_std
-    action = actor(torch.from_numpy(state).to(device).unsqueeze(0))
-    return action.squeeze(0).cpu().numpy().astype(np.float32)
+    chunk = actor(torch.from_numpy(state).to(device).unsqueeze(0))
+    return chunk.squeeze(0).cpu().numpy().astype(np.float32)
 
 
 def _unwrap(x) -> bool:
@@ -249,22 +265,35 @@ def collect_rollouts(
     (post-noise, post-clip) so the dynamics model sees ground-truth (s, a, s').
     """
     actor.eval()
+    N = actor.chunk_size
     with torch.no_grad():
         for i in range(num_episodes):
             obs, _ = env.reset(seed=seed_base + i)
-            while True:
-                state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
-                action = _act(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
+            done = False
+            while not done:
+                # Snapshot the chunk's start state, execute N actions
+                # open-loop, snapshot the end state, push as one entry. If
+                # the episode terminates mid-chunk, drop the partial — the
+                # dynamics model only trains on completed N-step transitions.
+                chunk_start = np.asarray(obs, dtype=np.float32).reshape(-1)
+                chunk = _act_chunk(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
                 if sigma > 0:
-                    action = np.clip(
-                        action + rng.normal(0.0, sigma, size=action.shape).astype(np.float32),
+                    chunk = np.clip(
+                        chunk + rng.normal(0.0, sigma, size=chunk.shape).astype(np.float32),
                         -1.0, 1.0,
                     )
-                obs, _, terminated, truncated, _ = env.step(action)
-                next_state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
-                buffer.add(state_raw, action, next_state_raw)
-                if _unwrap(terminated) or _unwrap(truncated):
-                    break
+                executed_chunk = chunk.copy()
+                complete = True
+                for t in range(N):
+                    obs, _, terminated, truncated, _ = env.step(chunk[t])
+                    if _unwrap(terminated) or _unwrap(truncated):
+                        done = True
+                        if t + 1 < N:
+                            complete = False
+                        break
+                if complete:
+                    chunk_end = np.asarray(obs, dtype=np.float32).reshape(-1)
+                    buffer.add(chunk_start, executed_chunk, chunk_end)
     actor.train()
 
 
@@ -280,13 +309,19 @@ def evaluate(
 ) -> dict[str, float]:
     success_once, success_at_end, returns, lengths = [], [], [], []
     actor.eval()
+    H = actor.chunk_size
     with torch.no_grad():
         for i in range(num_episodes):
             obs, _ = env.reset(seed=seed_base + i)
             ep_return, once, end, steps = 0.0, False, False, 0
+            chunk, chunk_idx = None, H
             while True:
                 steps += 1
-                action = _act(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
+                if chunk_idx >= H:
+                    chunk = _act_chunk(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
+                    chunk_idx = 0
+                action = chunk[chunk_idx]
+                chunk_idx += 1
                 obs, reward, terminated, truncated, info = env.step(action)
                 ep_return += float(np.asarray(reward).reshape(-1)[0])
                 sflag = _unwrap(info.get("success", False))
@@ -355,10 +390,12 @@ def main() -> None:
         num_demos=args.num_demos,
         normalize_states=args.normalize_states,
         horizon=args.actor_horizon,
+        chunk_size=args.action_chunk,
     )
     print(
         f"Dataset: {len(ds)} samples from {ds.num_episodes} episodes "
-        f"(state_dim={ds.state_dim} action_dim={ds.action_dim} horizon={ds.horizon})"
+        f"(state_dim={ds.state_dim} action_dim={ds.action_dim} "
+        f"horizon={ds.horizon} chunk_size={ds.chunk_size})"
     )
 
     sampler = RandomSampler(ds)
@@ -366,15 +403,18 @@ def main() -> None:
     iter_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
     dataloader = DataLoader(ds, batch_sampler=iter_sampler, num_workers=0)
 
-    actor = Actor(ds.state_dim, ds.action_dim).to(device)
+    actor = Actor(ds.state_dim, ds.action_dim, chunk_size=args.action_chunk).to(device)
     optimizer = optim.Adam(actor.parameters(), lr=args.lr)
-    forward_model = ForwardModel(ds.state_dim, ds.action_dim).to(device)
+    forward_model = ForwardModel(
+        ds.state_dim, ds.action_dim, chunk_size=args.action_chunk
+    ).to(device)
     forward_optimizer = optim.Adam(forward_model.parameters(), lr=args.lr)
 
     online_buffer = OnlineBuffer(
         capacity=args.online_buffer_size,
         state_dim=ds.state_dim,
         action_dim=ds.action_dim,
+        chunk_size=args.action_chunk,
     )
     buffer_rng = np.random.default_rng(args.seed)
     explore_rng = np.random.default_rng(args.seed + 1)
@@ -421,8 +461,9 @@ def main() -> None:
             #    compares to state_{t+H}; forward params are frozen for the
             #    rollout to avoid building grad buffers we wouldn't use anyway.
             optimizer.zero_grad()
-            pred = actor(obs)
-            actor_loss = F.mse_loss(pred, action)
+            # Actor produces a length-N chunk per query; BC supervises the
+            # full chunk against the expert's chunk.
+            actor_loss = F.mse_loss(actor(obs), action)
             forward_model.requires_grad_(False)
             # detach_surprise=False keeps the surprise -> trunk -> action path
             # alive so the actor pull term's gradient can reach actor params.
@@ -431,6 +472,8 @@ def main() -> None:
             rollout_surprise_grad: list[torch.Tensor] = []     # grad-tracking, for loss
             actor_pull_term = None
             with torch.set_grad_enabled(w_t > 0):
+                # H rollouts of (actor -> chunk -> forward); forward consumes
+                # the full chunk and predicts the state N env steps ahead.
                 s = obs
                 for _ in range(H):
                     s, ps = forward_model(
@@ -512,19 +555,18 @@ def main() -> None:
                     f"success_at_end={metrics['success_at_end']:.3f} "
                     f"return={metrics['episode_return']:.2f}"
                 )
+                ckpt_payload = {
+                    "actor": actor.state_dict(),
+                    "forward_model": forward_model.state_dict(),
+                    "iter": iteration,
+                    "metrics": metrics,
+                    "args": asdict(args),
+                }
+                torch.save(ckpt_payload, ckpt_dir / "latest.pt")
                 for k in ("success_once", "success_at_end"):
                     if metrics[k] > best_eval[k]:
                         best_eval[k] = metrics[k]
-                        torch.save(
-                            {
-                                "actor": actor.state_dict(),
-                                "forward_model": forward_model.state_dict(),
-                                "iter": iteration,
-                                "metrics": metrics,
-                                "args": asdict(args),
-                            },
-                            ckpt_dir / f"best_eval_{k}.pt",
-                        )
+                        torch.save(ckpt_payload, ckpt_dir / f"best_eval_{k}.pt")
 
             if args.save_freq is not None and iteration % args.save_freq == 0:
                 torch.save(

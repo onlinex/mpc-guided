@@ -75,8 +75,9 @@ def main() -> None:
 
     state_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
-    actor = Actor(state_dim, action_dim).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    chunk_size = int(ckpt.get("args", {}).get("action_chunk", 1))
+    actor = Actor(state_dim, action_dim, chunk_size=chunk_size).to(device)
     actor.load_state_dict(ckpt["actor"])
     actor.eval()
 
@@ -92,15 +93,20 @@ def main() -> None:
         for ep in range(args.episodes):
             obs, _ = env.reset(seed=args.seed + ep)
             ep_return, succeeded, steps = 0.0, False, 0
+            chunk, chunk_idx = None, chunk_size
             while True:
                 steps += 1
                 if not args.no_gui:
                     env.render()
-                state = np.asarray(obs, dtype=np.float32).reshape(-1)
-                state = (state - obs_mean) / obs_std
-                state_t = torch.from_numpy(state).to(device).unsqueeze(0)
-                with torch.no_grad():
-                    action = actor(state_t).squeeze(0).cpu().numpy().astype(np.float32)
+                if chunk_idx >= chunk_size:
+                    state = np.asarray(obs, dtype=np.float32).reshape(-1)
+                    state = (state - obs_mean) / obs_std
+                    state_t = torch.from_numpy(state).to(device).unsqueeze(0)
+                    with torch.no_grad():
+                        chunk = actor(state_t).squeeze(0).cpu().numpy().astype(np.float32)
+                    chunk_idx = 0
+                action = chunk[chunk_idx]
+                chunk_idx += 1
                 obs, reward, terminated, truncated, info = env.step(action)
                 ep_return += float(np.asarray(reward).reshape(-1)[0])
                 succeeded = succeeded or bool(np.asarray(info.get("success", False)).reshape(-1)[0])

@@ -82,15 +82,19 @@ class ForwardModel(nn.Module):
         self,
         state_dim: int,
         action_dim: int,
+        chunk_size: int = 1,
         hidden: int = 256,
         surprise_momentum: float = 1e-3,
     ) -> None:
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.chunk_size = chunk_size
         self.surprise_momentum = float(surprise_momentum)
+        # Takes a length-``chunk_size`` action sequence and predicts the state
+        # ``chunk_size`` env steps later — one shot per chunk, not per step.
         self.trunk = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden),
+            nn.Linear(state_dim + chunk_size * action_dim, hidden),
             nn.ReLU(),
         )
         # 2-layer head holds the bulk of next-state prediction capacity,
@@ -115,18 +119,22 @@ class ForwardModel(nn.Module):
     def forward(
         self,
         state: torch.Tensor,
-        action: torch.Tensor,
+        action_chunk: torch.Tensor,
         *,
         detach_surprise: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``detach_surprise=True`` (default) cuts the gradient path from the
-        surprise output back through the trunk — used during the dynamics step
-        so the head's loss can't tug the predictor. Pass ``False`` from the
-        actor rollout if you want surprise to be a *signal the actor can
-        optimize through* (e.g., maximize-surprise regularizer); the path then
-        becomes ``surprise -> trunk -> action -> actor params``.
+        """``action_chunk`` is ``(B, chunk_size, action_dim)``; the model
+        predicts the state ``chunk_size`` env steps after applying the chunk
+        open-loop. ``detach_surprise=True`` (default) cuts the gradient path
+        from the surprise output back through the trunk — used during the
+        dynamics step so the head's loss can't tug the predictor. Pass
+        ``False`` from the actor rollout if you want surprise to be a
+        *signal the actor can optimize through* (e.g., maximize-surprise
+        regularizer); the path then becomes
+        ``surprise -> trunk -> action -> actor params``.
         """
-        h = self.trunk(torch.cat([state, action], dim=-1))
+        flat_action = action_chunk.reshape(*action_chunk.shape[:-2], -1)
+        h = self.trunk(torch.cat([state, flat_action], dim=-1))
         next_state = self.state_head(h)
         h_for_surp = h.detach() if detach_surprise else h
         surprise = F.softplus(self.surprise_head(h_for_surp)).squeeze(-1)
@@ -135,16 +143,17 @@ class ForwardModel(nn.Module):
     def head_losses(
         self,
         state: torch.Tensor,
-        action: torch.Tensor,
+        action_chunk: torch.Tensor,
         target_next: torch.Tensor,
     ) -> HeadLosses:
         """Run forward once and produce the training losses for both heads.
 
-        The surprise head's target is the per-sample MSE of the state head —
-        an architectural property of this model, so the relationship lives
-        here rather than in the trainer.
+        ``target_next`` is the state ``chunk_size`` env steps after the chunk
+        starts. The surprise head's target is the per-sample MSE of the state
+        head — an architectural property of this model, so the relationship
+        lives here rather than in the trainer.
         """
-        pred_next, pred_surp = self(state, action)
+        pred_next, pred_surp = self(state, action_chunk)
         per_sample_error = ((pred_next - target_next) ** 2).mean(dim=-1).detach()
         return HeadLosses(
             state=F.mse_loss(pred_next, target_next),
