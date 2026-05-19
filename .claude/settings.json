@@ -3,7 +3,8 @@
     "allow": [
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(curl -sL https://raw.githubusercontent.com/haosulab/ManiSkill/main/examples/baselines/bc/bc.py)",
-      "Bash(rm -rf /tmp/build_check)"
+      "Bash(rm -rf /tmp/build_check)",
+      "Bash(git mv *)"
     ],
     "additionalDirectories": [
       "/private/tmp/build_check"

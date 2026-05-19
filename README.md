@@ -10,7 +10,7 @@ Two parallel BC entrypoints:
   upstream ManiSkill state-based BC baseline (`examples/baselines/bc/bc.py`). Reads
   the monolithic h5 produced by `replay_trajectory`. Use this when you want a
   strict reference against the published number.
-- **[train_bc.py](train_bc.py)** — same numerics (256x256 ReLU MLP, single-action
+- **[train.py](train.py)** — same numerics (256x256 ReLU MLP, single-action
   MSE, Adam lr 3e-4, batch 1024) but reads our per-episode dataset format produced
   by `build_dataset.py`. Adds an independently-trained `ForwardModel` and exposes
   `--actor-loss-weight` / `--total-loss-weight` to ablate direct vs model-based
@@ -39,7 +39,7 @@ uv run python train_bc_baseline.py \
 uv run python build_dataset.py \
   --source-h5 ~/.maniskill/demos/PickCube-v1/rl/trajectory.none.pd_joint_delta_pos.physx_cuda.h5 \
   --output-dir data/pickcube_rl
-uv run python train_bc.py \
+uv run python train.py \
   --dataset-dir data/pickcube_rl \
   --total-iters 50000 --run-name pickcube-bc-perepisode
 ```
@@ -90,7 +90,7 @@ the actor (gradients can't leak across optimizers).
 
 ### Joint actor loss
 
-`train_bc.py` computes three losses per iteration:
+`train.py` computes three losses per iteration:
 
 - `losses/actor_loss`  = `MSE(actor(obs), expert_action)`
 - `losses/dynamics_loss` = `MSE(forward(obs, expert_action), next_obs)` (trains forward)
@@ -137,7 +137,7 @@ uv run python play_bc_baseline.py \
 
 Opens the SAPIEN viewer (macOS uses MoltenVK). Pass `--no-gui` for headless or
 `--video-dir <path>` to save mp4s via `RecordEpisode`. Loads checkpoints from both
-`train_bc_baseline.py` and `train_bc.py` (they share the actor format).
+`train_bc_baseline.py` and `train.py` (they share the actor format).
 
 ## Tests
 
@@ -167,10 +167,10 @@ src/
   datasets/      builder.py for dataset construction
   backbone.py    encode_images (R3M wrapper, used by dataset builder)
   observations.py
-train_bc.py             Per-episode-format BC trainer with joint actor+dynamics loss
+train.py             Per-episode-format BC trainer with joint actor+dynamics loss
 train_bc_baseline.py    H5-format upstream-equivalent BC trainer
 build_dataset.py        Per-episode dataset builder
-play_bc.py              Checkpoint replay for train_bc.py
+play.py              Checkpoint replay for train.py
 play_bc_baseline.py     Checkpoint replay for train_bc_baseline.py
 ```
 
@@ -185,7 +185,7 @@ tests/legacy/           Tests for the above; auto-skipped from default pytest ru
 ```
 
 The parked code is functional and tested (`uv run pytest -m legacy`) but isn't
-imported by `train_bc*.py`. The dynamics path is worth revisiting if/when the BC
+imported by `train.py` or `train_bc_baseline.py`. The dynamics path is worth revisiting if/when the BC
 baseline is locked down and we want to layer planning or multi-step world-model
 training on top.
 

@@ -1,11 +1,11 @@
-"""Load a train_bc checkpoint and play it in the SAPIEN GUI.
+"""Load a train.py checkpoint and play it in the SAPIEN GUI.
 
 Mirrors play_bc_baseline.py but imports the active Actor from src.actor and
 honors --normalize-states from the checkpoint's saved args (recomputing stats
 from the dataset if needed).
 
 Usage:
-  uv run python play_bc.py \\
+  uv run python play.py \\
     --checkpoint runs/bc/<RUN>/checkpoints/best_eval_success_at_end.pt \\
     --episodes 5
 """

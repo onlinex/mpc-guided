@@ -2,7 +2,7 @@
 
 Plain MLP, ReLU activations, raw (unsquashed) output. This is the canonical
 ManiSkill state-based BC architecture and matches the reference baseline in
-train_bc_baseline.py byte-for-byte. Kept here so train_bc.py doesn't need to
+train_bc_baseline.py byte-for-byte. Kept here so train.py doesn't need to
 import from a sibling top-level script.
 """
 
