@@ -71,7 +71,8 @@ class Args:
     normalize_states: bool = False
     actor_loss_weight: float = 0.0
     total_loss_weight: float = 1.0
-    online_buffer_size: int = 100_000
+    actor_horizon: int = 1
+    online_buffer_size: int = 300_000
     online_mix_ratio: float = 0.95
     explore_sigma: float = 0.0
     seed: int = 42
@@ -112,6 +113,16 @@ def parse_args() -> Args:
         help="Weight on the model-based actor loss "
         "MSE(forward(obs, actor(obs)), next_obs). Default 1.0 (pure model-based). "
         "Set to 0 with --actor-loss-weight 1 for pure BC.",
+    )
+    p.add_argument(
+        "--actor-horizon",
+        type=int,
+        default=d.actor_horizon,
+        help="Number of forward-model steps the actor rolls out before comparing "
+        "to the goal state. H=1 (default) is single-step (byte-equivalent to the "
+        "old behavior); H>1 uses MSE(forward^H(obs, actor), state_{t+H}) so the "
+        "actor must find an action sequence that lands on the H-step-ahead expert "
+        "state. Dynamics still trains 1-step.",
     )
     p.add_argument(
         "--online-buffer-size",
@@ -174,6 +185,8 @@ def parse_args() -> Args:
         p.error("--online-mix-ratio must be in [0, 1]")
     if parsed.explore_sigma < 0:
         p.error("--explore-sigma must be >= 0")
+    if parsed.actor_horizon < 1:
+        p.error("--actor-horizon must be >= 1")
     return Args(**vars(parsed))
 
 
@@ -300,7 +313,7 @@ def main() -> None:
         args.env_id,
         obs_mode="state",
         control_mode=args.control_mode,
-        reward_mode="sparse",
+        reward_mode="dense",
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,
     )
@@ -317,10 +330,11 @@ def main() -> None:
         device=device,
         num_demos=args.num_demos,
         normalize_states=args.normalize_states,
+        horizon=args.actor_horizon,
     )
     print(
-        f"Dataset: {len(ds)} transitions from {ds.num_episodes} episodes "
-        f"(state_dim={ds.state_dim} action_dim={ds.action_dim})"
+        f"Dataset: {len(ds)} samples from {ds.num_episodes} episodes "
+        f"(state_dim={ds.state_dim} action_dim={ds.action_dim} horizon={ds.horizon})"
     )
 
     sampler = RandomSampler(ds)
@@ -350,10 +364,11 @@ def main() -> None:
     try:
         w_a = args.actor_loss_weight
         w_t = args.total_loss_weight
+        H = args.actor_horizon
         for iteration, batch in enumerate(
             tqdm(dataloader, total=args.total_iters, desc="bc/train")
         ):
-            obs, action, next_obs = batch
+            obs, action, next_obs, goal_obs = batch
 
             # 1. Forward-model update — direct MSE on expert action, optionally
             #    mixed with on-policy transitions collected during eval.
@@ -382,19 +397,31 @@ def main() -> None:
 
             # 2. Actor update: w_a * actor_loss + w_t * total_loss.
             #    Either weight may be 0 (validated in parse_args so not both).
-            #    Joint backward accumulates grads on forward when w_t>0; those
-            #    are discarded next iter via forward_optimizer.zero_grad().
+            #    total_loss rolls the actor + forward forward H steps and
+            #    compares to state_{t+H}; H=1 is the single-step baseline.
+            #    forward params are frozen via requires_grad_(False) for the
+            #    rollout so autograd doesn't build grad buffers for them — the
+            #    actor_optimizer wouldn't update them anyway, this just saves
+            #    memory (matters as H or the forward model grows).
             optimizer.zero_grad()
             pred = actor(obs)
             actor_loss = F.mse_loss(pred, action)
+            forward_model.requires_grad_(False)
             if w_t > 0:
-                total_loss = F.mse_loss(forward_model(obs, actor(obs)), next_obs)
+                s = obs
+                for _ in range(H):
+                    s = forward_model(s, actor(s))
+                total_loss = F.mse_loss(s, goal_obs)
             else:
                 with torch.no_grad():
-                    total_loss = F.mse_loss(forward_model(obs, actor(obs)), next_obs)
+                    s = obs
+                    for _ in range(H):
+                        s = forward_model(s, actor(s))
+                    total_loss = F.mse_loss(s, goal_obs)
             joint_loss = w_a * actor_loss + w_t * total_loss
             joint_loss.backward()
             optimizer.step()
+            forward_model.requires_grad_(True)
 
             if iteration % args.log_freq == 0:
                 writer.add_scalar("losses/actor_loss", float(actor_loss.detach().cpu()), iteration)

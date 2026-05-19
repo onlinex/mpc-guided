@@ -134,7 +134,7 @@ Logged tensors:
 --total-iters          50000
 --batch-size           1024
 --lr                   3e-4
---online-buffer-size   100000     # FIFO capacity (transitions)
+--online-buffer-size   300000     # FIFO capacity (transitions)
 --online-mix-ratio     0.95       # fraction of dynamics batch from online buffer
 --explore-sigma        0.1        # rollout-only Gaussian noise on actions
 --rollout-freq         1000       # train iters between rollout/eval rounds

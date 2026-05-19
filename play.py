@@ -63,7 +63,7 @@ def main() -> None:
         args.env_id,
         obs_mode="state",
         control_mode=args.control_mode,
-        reward_mode="sparse",
+        reward_mode="dense",
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,
         render_mode=render_mode,
