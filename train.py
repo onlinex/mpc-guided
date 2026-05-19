@@ -373,26 +373,38 @@ def main() -> None:
             # 1. Forward-model update — direct MSE on expert action, optionally
             #    mixed with on-policy transitions collected during eval.
             #    Done first so the actor's joint loss can use the freshest forward.
+            #    The surprise head is trained alongside on the detached per-sample
+            #    MSE of the state head; its grads only touch the head itself
+            #    (trunk is detached inside ForwardModel.forward).
             k = min(int(args.batch_size * args.online_mix_ratio), len(online_buffer))
             n_bc = args.batch_size - k
             forward_optimizer.zero_grad()
             if n_bc > 0:
-                fwd_loss_bc = F.mse_loss(forward_model(obs[:n_bc], action[:n_bc]), next_obs[:n_bc])
+                pred_next_bc, pred_surp_bc = forward_model(obs[:n_bc], action[:n_bc])
+                fwd_loss_bc = F.mse_loss(pred_next_bc, next_obs[:n_bc])
+                actual_surp_bc = ((pred_next_bc - next_obs[:n_bc]) ** 2).mean(dim=-1).detach()
+                surp_loss_bc = F.mse_loss(pred_surp_bc, actual_surp_bc)
             else:
-                fwd_loss_bc = None
+                fwd_loss_bc = surp_loss_bc = None
             if k > 0:
                 on_s, on_a, on_ns = online_buffer.sample(k, buffer_rng)
                 on_s_t = (torch.from_numpy(on_s).to(device) - obs_mean_t) / obs_std_t
                 on_ns_t = (torch.from_numpy(on_ns).to(device) - obs_mean_t) / obs_std_t
                 on_a_t = torch.from_numpy(on_a).to(device)
-                fwd_loss_on = F.mse_loss(forward_model(on_s_t, on_a_t), on_ns_t)
+                pred_next_on, pred_surp_on = forward_model(on_s_t, on_a_t)
+                fwd_loss_on = F.mse_loss(pred_next_on, on_ns_t)
+                actual_surp_on = ((pred_next_on - on_ns_t) ** 2).mean(dim=-1).detach()
+                surp_loss_on = F.mse_loss(pred_surp_on, actual_surp_on)
             else:
-                fwd_loss_on = None
+                fwd_loss_on = surp_loss_on = None
             if fwd_loss_bc is not None and fwd_loss_on is not None:
                 fwd_loss = (n_bc * fwd_loss_bc + k * fwd_loss_on) / args.batch_size
+                surp_loss = (n_bc * surp_loss_bc + k * surp_loss_on) / args.batch_size
+            elif fwd_loss_on is None:
+                fwd_loss, surp_loss = fwd_loss_bc, surp_loss_bc
             else:
-                fwd_loss = fwd_loss_bc if fwd_loss_on is None else fwd_loss_on
-            fwd_loss.backward()
+                fwd_loss, surp_loss = fwd_loss_on, surp_loss_on
+            (fwd_loss + surp_loss).backward()
             forward_optimizer.step()
 
             # 2. Actor update: w_a * actor_loss + w_t * total_loss.
@@ -407,16 +419,19 @@ def main() -> None:
             pred = actor(obs)
             actor_loss = F.mse_loss(pred, action)
             forward_model.requires_grad_(False)
+            rollout_surprise: list[torch.Tensor] = []
             if w_t > 0:
                 s = obs
                 for _ in range(H):
-                    s = forward_model(s, actor(s))
+                    s, ps = forward_model(s, actor(s))
+                    rollout_surprise.append(ps.detach().mean())
                 total_loss = F.mse_loss(s, goal_obs)
             else:
                 with torch.no_grad():
                     s = obs
                     for _ in range(H):
-                        s = forward_model(s, actor(s))
+                        s, ps = forward_model(s, actor(s))
+                        rollout_surprise.append(ps.mean())
                     total_loss = F.mse_loss(s, goal_obs)
             joint_loss = w_a * actor_loss + w_t * total_loss
             joint_loss.backward()
@@ -433,6 +448,15 @@ def main() -> None:
                 writer.add_scalar("losses/total_loss", float(total_loss.detach().cpu()), iteration)
                 writer.add_scalar("online/buffer_size", len(online_buffer), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
+                writer.add_scalar("surprise/head_loss", float(surp_loss.detach().cpu()), iteration)
+                for step_idx, sv in enumerate(rollout_surprise, start=1):
+                    writer.add_scalar(f"surprise/rollout_step_{step_idx}", float(sv.cpu()), iteration)
+                if rollout_surprise:
+                    writer.add_scalar(
+                        "surprise/rollout_mean",
+                        float(torch.stack(rollout_surprise).mean().cpu()),
+                        iteration,
+                    )
 
             if iteration % args.rollout_freq == 0:
                 collect_rollouts(
