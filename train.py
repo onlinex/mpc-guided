@@ -385,7 +385,7 @@ def main() -> None:
                 actual_surp_bc = ((pred_next_bc - next_obs[:n_bc]) ** 2).mean(dim=-1).detach()
                 surp_loss_bc = F.mse_loss(pred_surp_bc, actual_surp_bc)
             else:
-                fwd_loss_bc = surp_loss_bc = None
+                fwd_loss_bc = surp_loss_bc = actual_surp_bc = None
             if k > 0:
                 on_s, on_a, on_ns = online_buffer.sample(k, buffer_rng)
                 on_s_t = (torch.from_numpy(on_s).to(device) - obs_mean_t) / obs_std_t
@@ -396,16 +396,22 @@ def main() -> None:
                 actual_surp_on = ((pred_next_on - on_ns_t) ** 2).mean(dim=-1).detach()
                 surp_loss_on = F.mse_loss(pred_surp_on, actual_surp_on)
             else:
-                fwd_loss_on = surp_loss_on = None
+                fwd_loss_on = surp_loss_on = actual_surp_on = None
             if fwd_loss_bc is not None and fwd_loss_on is not None:
                 fwd_loss = (n_bc * fwd_loss_bc + k * fwd_loss_on) / args.batch_size
                 surp_loss = (n_bc * surp_loss_bc + k * surp_loss_on) / args.batch_size
+                actual_combined = torch.cat([actual_surp_bc, actual_surp_on])
             elif fwd_loss_on is None:
                 fwd_loss, surp_loss = fwd_loss_bc, surp_loss_bc
+                actual_combined = actual_surp_bc
             else:
                 fwd_loss, surp_loss = fwd_loss_on, surp_loss_on
+                actual_combined = actual_surp_on
             (fwd_loss + surp_loss).backward()
             forward_optimizer.step()
+            # EMA tracks the same BC+online mixture the dynamics is trained on
+            # so the head's [0, 1] calibration matches what dynamics actually sees.
+            forward_model.update_surprise_stats(actual_combined)
 
             # 2. Actor update: w_a * actor_loss + w_t * total_loss.
             #    Either weight may be 0 (validated in parse_args so not both).
@@ -419,19 +425,21 @@ def main() -> None:
             pred = actor(obs)
             actor_loss = F.mse_loss(pred, action)
             forward_model.requires_grad_(False)
+            # Keep full (B,) per step so we can log distribution (histogram +
+            # percentiles), not just the batch mean.
             rollout_surprise: list[torch.Tensor] = []
             if w_t > 0:
                 s = obs
                 for _ in range(H):
                     s, ps = forward_model(s, actor(s))
-                    rollout_surprise.append(ps.detach().mean())
+                    rollout_surprise.append(ps.detach())
                 total_loss = F.mse_loss(s, goal_obs)
             else:
                 with torch.no_grad():
                     s = obs
                     for _ in range(H):
                         s, ps = forward_model(s, actor(s))
-                        rollout_surprise.append(ps.mean())
+                        rollout_surprise.append(ps)
                     total_loss = F.mse_loss(s, goal_obs)
             joint_loss = w_a * actor_loss + w_t * total_loss
             joint_loss.backward()
@@ -449,14 +457,18 @@ def main() -> None:
                 writer.add_scalar("online/buffer_size", len(online_buffer), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
                 writer.add_scalar("surprise/head_loss", float(surp_loss.detach().cpu()), iteration)
-                for step_idx, sv in enumerate(rollout_surprise, start=1):
-                    writer.add_scalar(f"surprise/rollout_step_{step_idx}", float(sv.cpu()), iteration)
                 if rollout_surprise:
-                    writer.add_scalar(
-                        "surprise/rollout_mean",
-                        float(torch.stack(rollout_surprise).mean().cpu()),
-                        iteration,
-                    )
+                    # (H, B) raw -> (H, B) normalized in [0, 1]. Log batch
+                    # mean and the full distribution per step.
+                    norm = forward_model.normalize_actual(
+                        torch.stack(rollout_surprise)
+                    ).cpu()
+                    for step_idx in range(norm.shape[0]):
+                        k = step_idx + 1
+                        step_vals = norm[step_idx]
+                        writer.add_scalar(f"surprise/rollout_step/{k}", float(step_vals.mean()), iteration)
+                        writer.add_histogram(f"surprise/rollout_dist/{k}", step_vals, iteration)
+                    writer.add_scalar("surprise/rollout_mean", float(norm.mean()), iteration)
 
             if iteration % args.rollout_freq == 0:
                 collect_rollouts(
