@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from src.networks import MLP
+from src.legacy.networks import MLP
 
 
 @dataclass(frozen=True)

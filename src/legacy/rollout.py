@@ -12,7 +12,7 @@ from typing import Callable
 import gymnasium as gym
 import numpy as np
 
-from src.utils import to_scalar_bool
+from src.legacy.utils import to_scalar_bool
 
 
 def rollout(

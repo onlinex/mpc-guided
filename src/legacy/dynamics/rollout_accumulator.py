@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.dynamics.episode_store import EpisodeStore
+from src.legacy.dynamics.episode_store import EpisodeStore
 
 
 class RolloutAccumulator:

@@ -6,9 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.dynamics.episode_store import EpisodeStore
-from src.dynamics.model import ForwardDynamicsConfig, ForwardDynamicsModel
-from src.dynamics.training import DynamicsTrainer, DynamicsTrainerConfig
+from src.legacy.dynamics.episode_store import EpisodeStore
+from src.legacy.dynamics.model import ForwardDynamicsConfig, ForwardDynamicsModel
+from src.legacy.dynamics.training import DynamicsTrainer, DynamicsTrainerConfig
 
 DEVICE = torch.device("cpu")
 VISUAL_DIM = 8

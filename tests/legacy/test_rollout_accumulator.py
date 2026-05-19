@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from src.dynamics.episode_store import EpisodeStore
-from src.dynamics.rollout_accumulator import RolloutAccumulator
+from src.legacy.dynamics.episode_store import EpisodeStore
+from src.legacy.dynamics.rollout_accumulator import RolloutAccumulator
 
 DEVICE = torch.device("cpu")
 VISUAL_DIM = 4

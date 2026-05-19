@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.dynamics.episode_store import EpisodeStore
+from src.legacy.dynamics.episode_store import EpisodeStore
 
 DEVICE = torch.device("cpu")
 

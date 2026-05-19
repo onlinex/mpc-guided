@@ -42,5 +42,6 @@ pythonpath = ["."]
 markers = [
     "env: requires a live ManiSkill env (slow, several seconds per test)",
     "dataset: requires the built expert video dataset on disk; auto-skipped otherwise",
+    "legacy: parked code under src/legacy/ and legacy/, off the active BC path",
 ]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not legacy'"

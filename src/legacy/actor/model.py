@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from src.legacy.actor.config import ActorConfig
-from src.networks import MLP
+from src.legacy.networks import MLP
 
 
 class Actor(nn.Module):

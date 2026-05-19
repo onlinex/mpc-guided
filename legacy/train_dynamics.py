@@ -27,8 +27,8 @@ from src.backbone import (
     R3M_MODEL_IDS,
     build_backbone,
 )
-from src.datasets.expert_transitions import seed_store_with_expert
-from src.datasets.video_pairs import VideoFramePairSampler
+from src.legacy.datasets.expert_transitions import seed_store_with_expert
+from src.legacy.datasets.video_pairs import VideoFramePairSampler
 from src.observations import (
     encode_observation,
     extract_privileged_state,
@@ -36,7 +36,7 @@ from src.observations import (
     privileged_state_dim_of,
     proprio_dim_of,
 )
-from src.dynamics import (
+from src.legacy.dynamics import (
     DynamicsTrainer,
     DynamicsTrainerConfig,
     EpisodeStore,
@@ -44,7 +44,7 @@ from src.dynamics import (
     ForwardDynamicsModel,
     RolloutAccumulator,
 )
-from src.utils import OUNoise, pick_device, to_scalar_bool
+from src.legacy.utils import OUNoise, pick_device, to_scalar_bool
 
 
 ENV_ID = "PickCube-v1"

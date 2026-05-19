@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.dynamics.model import ForwardDynamicsConfig, ForwardDynamicsModel
+from src.legacy.dynamics.model import ForwardDynamicsConfig, ForwardDynamicsModel
 
 
 def _make(visual_dim=8, proprio_dim=3, action_dim=4):

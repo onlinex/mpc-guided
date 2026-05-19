@@ -142,16 +142,18 @@ Opens the SAPIEN viewer (macOS uses MoltenVK). Pass `--no-gui` for headless or
 ## Tests
 
 ```bash
+uv run pytest                               # active suite (legacy auto-skipped)
 uv run pytest -m "not env"                  # fast unit tests, ~5s
 uv run pytest -m "dataset"                  # static dataset validation (needs build)
 uv run pytest -m "env and dataset"          # slow replay-through-env tests
-uv run pytest                               # everything
+uv run pytest -m "legacy"                   # parked tests (src/legacy/, legacy/)
 ```
 
 Markers (declared in [pyproject.toml](pyproject.toml)):
 
 - `env` — constructs a ManiSkill env (seconds of import + reset time).
 - `dataset` — reads from `data/pickcube_rl/`; auto-skipped if not built.
+- `legacy` — anything under `tests/legacy/`; deselected by default.
 
 ## Repo layout
 
@@ -159,28 +161,33 @@ Active:
 
 ```text
 src/
-  actor/      Actor + ForwardModel (the current BC stack)
-  bc/         StateBCDataset (loads per-episode dataset)
-  datasets/   builder.py for dataset construction
-  backbone.py / networks.py / observations.py / rollout.py / utils.py
+  actor/         Actor + ForwardModel (the current BC stack)
+  bc/            StateBCDataset (loads per-episode dataset)
+  buffer/        OnlineBuffer (FIFO ring fed by rollouts)
+  datasets/      builder.py for dataset construction
+  backbone.py    encode_images (R3M wrapper, used by dataset builder)
+  observations.py
 train_bc.py             Per-episode-format BC trainer with joint actor+dynamics loss
 train_bc_baseline.py    H5-format upstream-equivalent BC trainer
 build_dataset.py        Per-episode dataset builder
-play_bc_baseline.py     Checkpoint replay (SAPIEN GUI or mp4)
+play_bc.py              Checkpoint replay for train_bc.py
+play_bc_baseline.py     Checkpoint replay for train_bc_baseline.py
 ```
 
 Parked (kept for later, not on the BC path):
 
 ```text
-src/dynamics/       Episode-keyed replay store + ForwardDynamicsModel + multi-step trainer
-src/legacy/actor/   Chunked + tanh-squashed Actor with goal-state VideoActorTrainer
-train_dynamics.py   Old goal-state-via-dynamics training loop
-demo.py             Uses legacy actor checkpoints
+src/legacy/             Old code: actor/ (chunked+squashed), dynamics/ (episode store +
+                        multi-step trainer), datasets/ (expert_transitions, video_pairs),
+                        networks.py, rollout.py, utils.py
+legacy/                 Old entry points: train_dynamics.py, demo.py
+tests/legacy/           Tests for the above; auto-skipped from default pytest runs
 ```
 
-The parked code is functional and tested but isn't imported by `train_bc*.py`.
-The dynamics path is worth revisiting if/when the BC baseline is locked down
-and we want to layer planning or multi-step world-model training on top.
+The parked code is functional and tested (`uv run pytest -m legacy`) but isn't
+imported by `train_bc*.py`. The dynamics path is worth revisiting if/when the BC
+baseline is locked down and we want to layer planning or multi-step world-model
+training on top.
 
 ## dstack
 

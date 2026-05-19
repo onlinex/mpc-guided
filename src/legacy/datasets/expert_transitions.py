@@ -12,8 +12,8 @@ import torch
 from tqdm import tqdm
 
 from src.backbone import encode_images
-from src.datasets.video_pairs import to_uint8
-from src.dynamics.episode_store import EpisodeStore
+from src.legacy.datasets.video_pairs import to_uint8
+from src.legacy.dynamics.episode_store import EpisodeStore
 
 
 def _backbone_cache_key(backbone: torch.nn.Module) -> str:

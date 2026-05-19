@@ -9,9 +9,9 @@ import torch.nn.functional as F
 
 from src.legacy.actor.model import Actor
 from src.backbone import encode_images
-from src.datasets.video_pairs import VideoFramePairSampler
-from src.dynamics.episode_store import WindowBatch
-from src.dynamics.model import ForwardDynamicsModel
+from src.legacy.datasets.video_pairs import VideoFramePairSampler
+from src.legacy.dynamics.episode_store import WindowBatch
+from src.legacy.dynamics.model import ForwardDynamicsModel
 
 
 @dataclass(frozen=True)

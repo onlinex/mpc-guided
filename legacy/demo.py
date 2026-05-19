@@ -13,8 +13,8 @@ import torch
 from src.legacy.actor import Actor, ActorConfig
 from src.backbone import build_backbone
 from src.observations import encode_observation, extract_proprio
-from src.rollout import rollout
-from src.utils import OUNoise, pick_device
+from src.legacy.rollout import rollout
+from src.legacy.utils import OUNoise, pick_device
 
 
 ENV_ID = "PickCube-v1"
