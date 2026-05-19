@@ -1,20 +1,15 @@
 # mpc-control
 
-State-based behavior cloning on ManiSkill PickCube, with an optional jointly-trained
-forward dynamics model that can be mixed into the actor's loss for model-grounded
-regularization (or used as the sole training signal).
+Model-based imitation on ManiSkill PickCube. The actor is trained **only** through
+a jointly-learned forward dynamics model: given expert `(state, next_state)` pairs,
+it has to find actions that the forward model maps from one to the other. The
+forward model itself is trained mostly on the actor's own on-policy rollouts via
+an online buffer, with optional action noise for exploration.
 
-Two parallel BC entrypoints:
-
-- **[train_bc_baseline.py](train_bc_baseline.py)** — byte-equivalent port of the
-  upstream ManiSkill state-based BC baseline (`examples/baselines/bc/bc.py`). Reads
-  the monolithic h5 produced by `replay_trajectory`. Use this when you want a
-  strict reference against the published number.
-- **[train.py](train.py)** — same numerics (256x256 ReLU MLP, single-action
-  MSE, Adam lr 3e-4, batch 1024) but reads our per-episode dataset format produced
-  by `build_dataset.py`. Adds an independently-trained `ForwardModel` and exposes
-  `--actor-loss-weight` / `--total-loss-weight` to ablate direct vs model-based
-  actor losses.
+The main entry point is **[train.py](train.py)** (training) + **[play.py](play.py)**
+(rollout). A separate **[train_bc_baseline.py](train_bc_baseline.py)** is kept as
+a byte-equivalent port of the upstream ManiSkill state-based BC baseline — used
+only as a reference point, not the path we're developing.
 
 ## Quick start
 
@@ -24,28 +19,21 @@ uv sync
 # 1. Download RL demos (one-time).
 uv run python -m mani_skill.utils.download_demo PickCube-v1
 
-# 2. Convert to state obs + pd_joint_delta_pos control (drops a new h5 next to source).
-uv run python -m mani_skill.trajectory.replay_trajectory \
-  --traj-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.none.pd_joint_delta_pos.physx_cuda.h5 \
-  --use-first-env-state -c pd_joint_delta_pos -o state \
-  --save-traj -b physx_cpu -n 10
-
-# 3a. Run the strict upstream baseline (h5 in, eval rollouts out).
-uv run python train_bc_baseline.py \
-  --demo-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
-  --total-iters 50000 --run-name pickcube-bc-baseline
-
-# 3b. OR: build our per-episode dataset, train on that.
+# 2. Build the per-episode dataset.
 uv run python build_dataset.py \
   --source-h5 ~/.maniskill/demos/PickCube-v1/rl/trajectory.none.pd_joint_delta_pos.physx_cuda.h5 \
   --output-dir data/pickcube_rl
+
+# 3. Train (defaults: pure model-based, 0.95 online mix, no exploration noise).
 uv run python train.py \
   --dataset-dir data/pickcube_rl \
-  --total-iters 50000 --run-name pickcube-bc-perepisode
+  --total-iters 50000 --run-name pickcube-mb
 ```
 
-State-based BC on RL demos reaches `eval/success_at_end` ≈ 0.8 within 50k iters on
-PickCube. The two scripts produce comparable curves.
+Reaches `eval/success_at_end` ≈ 0.8 on PickCube within 50k iters. The
+[upstream BC baseline](#baseline-reference) gets a comparable number with
+ordinary BC; the interesting bit here is that the actor is solving the task
+without ever seeing the expert's actions as a training signal.
 
 ## Dataset format
 
@@ -78,25 +66,23 @@ of bugs.
 
 ## Actor + ForwardModel
 
-[src/actor/](src/actor/) is the active code path. Two minimal modules:
+[src/actor/](src/actor/) defines two pure MLPs:
 
-- `Actor`: `state_dim → 256 → ReLU → 256 → ReLU → action_dim`. Raw linear output,
-  no squashing — matches the upstream baseline.
+- `Actor`: `state_dim → 256 → ReLU → 256 → ReLU → action_dim`. Raw linear output.
 - `ForwardModel`: `(state, action) → 256 → ReLU → 256 → ReLU → state_dim`.
 
-Both are pure MLPs. The forward model is trained alongside the actor on the same
-per-episode data with its own optimizer, so by default it has zero influence on
-the actor (gradients can't leak across optimizers).
+Each has its own optimizer — gradients can't leak across them. The forward model
+is the only path through which the actor's loss reaches reality.
 
-### Joint actor loss
+### Losses
 
-`train.py` computes three losses per iteration:
+Per iteration, `train.py` computes three:
 
-- `losses/actor_loss`  = `MSE(actor(obs), expert_action)`
-- `losses/dynamics_loss` = `MSE(forward(obs, expert_action), next_obs)` (trains forward)
-- `losses/total_loss` = `MSE(forward(obs, actor(obs)), next_obs)` (couples actor→forward→state)
+- `losses/actor_loss`  = `MSE(actor(obs), expert_action)` — **diagnostic only** at the default weights
+- `losses/dynamics_loss` = `MSE(forward(obs, action), next_obs)` — trains the forward model
+- `losses/total_loss` = `MSE(forward(obs, actor(obs)), next_obs)` — couples actor → forward → state
 
-The actor is trained on a weighted combination:
+The actor is trained on a weighted mix:
 
 ```
 actor_step_loss = actor_loss_weight * actor_loss + total_loss_weight * total_loss
@@ -104,13 +90,42 @@ actor_step_loss = actor_loss_weight * actor_loss + total_loss_weight * total_los
 
 | `--actor-loss-weight` | `--total-loss-weight` | Behavior |
 |---|---|---|
-| `0.0` (default) | `1.0` (default) | Pure model-based imitation. Actor only sees expert states; learns to produce actions that the (jointly-trained) forward model maps onto expert next states. On PickCube reaches comparable final reward to direct BC, slightly worse actor_loss along the way. |
-| `1.0` | `> 0` | Joint: direct BC + model-grounded regularization. Robust on PickCube; on this dataset `1.0`/`5.0` train as well as pure BC. |
-| `1.0` | `0.0` | Pure BC. ForwardModel still trains but doesn't influence actor. `total_loss` logged as diagnostic. |
+| `0.0` (default) | `1.0` (default) | **Pure model-based imitation.** Actor never sees the expert's action as a target; it only sees expert `(s, s')` pairs and finds actions that the forward model maps from one to the other. Surprisingly competitive on PickCube. |
+| `1.0` | `> 0` | Joint: direct BC + model-grounded regularization. |
+| `1.0` | `0.0` | Pure BC. ForwardModel still trains but doesn't influence the actor. |
 
-`total_loss - dynamics_loss` is a useful compounding-error diagnostic: with the
-actor in-distribution it's small; if the actor drifts off-policy w.r.t. forward
-the gap grows.
+`total_loss - dynamics_loss` is a useful compounding-error diagnostic: small
+when the actor stays in distribution, grows when it drifts off-policy w.r.t.
+the forward model.
+
+### Online buffer + rollouts
+
+The dynamics model trains on a mix of expert transitions (from the BC dataset)
+and on-policy transitions collected from live env rollouts. Each `rollout_freq`
+iterations the trainer runs two passes:
+
+1. **Rollouts** — `num_rollout_episodes` (default 100) episodes in the env, optionally
+   with Gaussian action noise (`--explore-sigma`, default 0). Each `(s, a, s')` is
+   pushed into a fixed-size FIFO ring ([`OnlineBuffer`](src/buffer/online.py)). No
+   metrics, no influence on the eval signal.
+2. **Eval** — `num_eval_episodes` (default 50) deterministic episodes for metrics
+   (`success_at_end`, `success_once`, `episode_return`). Drives the best-checkpoint
+   signal.
+
+Per dynamics-step, `k = floor(batch_size * online_mix_ratio)` samples are drawn
+from the buffer (clamped by buffer size early in training); the rest comes from
+the BC batch. The two slices are normalized with the same pinned dataset stats so
+the forward model sees a single space. The actor's `total_loss` always uses the
+BC slice (`obs`, `next_obs`) only — no online tensors enter the actor's graph.
+
+The default (`online_mix_ratio=0.95`) means the forward model is shaped almost
+entirely by what the actor *actually does* in the env, while the actor learns
+inverse-dynamics targets against that on-policy-trained model.
+
+Logged tensors:
+
+- `losses/dynamics_loss_bc` / `losses/dynamics_loss_online` — disjoint sub-batches
+- `online/buffer_size` — useful for tracking buffer warmup
 
 ### Other flags
 
@@ -119,9 +134,12 @@ the gap grows.
 --total-iters          50000
 --batch-size           1024
 --lr                   3e-4
+--online-buffer-size   100000     # FIFO capacity (transitions)
+--online-mix-ratio     0.95       # fraction of dynamics batch from online buffer
+--explore-sigma        0.1        # rollout-only Gaussian noise on actions
 --rollout-freq         1000       # train iters between rollout/eval rounds
---num-rollout-episodes 100        # episodes per rollout (feeds online buffer)
---num-eval-episodes    50         # episodes per eval (deterministic metrics)
+--num-rollout-episodes 100        # episodes per rollout (feeds buffer, no metrics)
+--num-eval-episodes    50         # deterministic eval episodes (drives best-ckpt)
 --max-episode-steps    100
 --normalize-states     off        # per-dim zero-mean unit-var input normalization
 --seed                 42
@@ -130,14 +148,35 @@ the gap grows.
 ## Eval / playback
 
 ```bash
-uv run python play_bc_baseline.py \
+uv run python play.py \
   --checkpoint runs/bc/<RUN>/checkpoints/best_eval_success_at_end.pt \
   --episodes 5
 ```
 
-Opens the SAPIEN viewer (macOS uses MoltenVK). Pass `--no-gui` for headless or
-`--video-dir <path>` to save mp4s via `RecordEpisode`. Loads checkpoints from both
-`train_bc_baseline.py` and `train.py` (they share the actor format).
+Opens the SAPIEN viewer (macOS uses MoltenVK). `--no-gui` for headless;
+`--video-dir <path>` to save mp4s via `RecordEpisode`. Recovers normalization
+stats from the checkpoint's saved args if the run used `--normalize-states`.
+
+`play_bc_baseline.py` is the equivalent loader for `train_bc_baseline.py`
+checkpoints.
+
+## Baseline reference
+
+`train_bc_baseline.py` is a byte-equivalent port of the upstream ManiSkill
+state-based BC baseline (`examples/baselines/bc/bc.py`). It reads the monolithic
+h5 from `replay_trajectory` rather than the per-episode dataset, and trains the
+actor with plain `MSE(actor(obs), expert_action)`. Use it when you want a strict
+comparison against the published number — not as a starting point for changes.
+
+```bash
+uv run python -m mani_skill.trajectory.replay_trajectory \
+  --traj-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.none.pd_joint_delta_pos.physx_cuda.h5 \
+  --use-first-env-state -c pd_joint_delta_pos -o state \
+  --save-traj -b physx_cpu -n 10
+uv run python train_bc_baseline.py \
+  --demo-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
+  --total-iters 50000 --run-name pickcube-bc-baseline
+```
 
 ## Tests
 
@@ -161,17 +200,19 @@ Active:
 
 ```text
 src/
-  actor/         Actor + ForwardModel (the current BC stack)
-  bc/            StateBCDataset (loads per-episode dataset)
-  buffer/        OnlineBuffer (FIFO ring fed by rollouts)
-  datasets/      builder.py for dataset construction
-  backbone.py    encode_images (R3M wrapper, used by dataset builder)
+  actor/                Actor + ForwardModel
+  bc/                   StateBCDataset (loads per-episode dataset)
+  buffer/               OnlineBuffer (FIFO ring fed by rollouts)
+  datasets/             builder.py for per-episode dataset construction
+  backbone.py           encode_images (R3M wrapper, used by builder)
   observations.py
-train.py             Per-episode-format BC trainer with joint actor+dynamics loss
-train_bc_baseline.py    H5-format upstream-equivalent BC trainer
+
+train.py                Main trainer (model-based imitation + online buffer)
+play.py                 Checkpoint replay for train.py
 build_dataset.py        Per-episode dataset builder
-play.py              Checkpoint replay for train.py
-play_bc_baseline.py     Checkpoint replay for train_bc_baseline.py
+
+train_bc_baseline.py    Reference: upstream-equivalent state-based BC
+play_bc_baseline.py     Reference: checkpoint replay for the baseline
 ```
 
 Parked (kept for later, not on the BC path):
@@ -185,9 +226,8 @@ tests/legacy/           Tests for the above; auto-skipped from default pytest ru
 ```
 
 The parked code is functional and tested (`uv run pytest -m legacy`) but isn't
-imported by `train.py` or `train_bc_baseline.py`. The dynamics path is worth revisiting if/when the BC
-baseline is locked down and we want to layer planning or multi-step world-model
-training on top.
+imported by `train.py` or `train_bc_baseline.py`. Worth revisiting only if we
+want to layer planning or multi-step world-model training on top.
 
 ## dstack
 
