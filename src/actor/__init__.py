@@ -3,7 +3,7 @@
 The chunked/squashed/visual flavor lives in src/legacy/actor/.
 """
 
-from src.actor.forward import ForwardModel
+from src.actor.forward import ForwardModel, HeadLosses
 from src.actor.actor import Actor
 
-__all__ = ["Actor", "ForwardModel"]
+__all__ = ["Actor", "ForwardModel", "HeadLosses"]

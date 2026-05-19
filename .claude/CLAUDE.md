@@ -4,7 +4,7 @@ Project-specific context. Keep concise — this file is loaded into Claude's con
 
 ## What this repo is
 
-Model-based imitation on ManiSkill PickCube. The actor is trained **only** through a jointly-learned forward dynamics model: given expert `(state, next_state)` pairs, it has to find actions that the forward model maps from one to the other. The forward model trains mostly on the actor's own on-policy rollouts.
+Model-based imitation on ManiSkill PickCube. The actor is trained **only** through a jointly-learned forward dynamics model: given expert `(state, state_{t+H})` pairs, it has to find actions whose H-step rollout through the forward model lands on the goal state. The forward model trains mostly on the actor's own on-policy rollouts.
 
 See [README.md](README.md) for the user-facing version.
 
@@ -40,6 +40,7 @@ These are kept tested but aren't imported by the active flow. Don't reach for th
 - **Two optimizers, no crossover**: `actor_optimizer` updates actor params only; `forward_optimizer` updates forward model params only. Even when a backward writes grads to the "wrong" set (e.g., actor's `total_loss` writes grads to forward params via the chain rule), those grads are discarded by the next `zero_grad()`. The separation is enforced by optimizer ownership, not by `.train()`/`.eval()` mode.
 - **Online buffer feeds dynamics only**: the actor's `total_loss` always uses the BC slice (`obs`, `goal_obs`) — no online tensors enter the actor's graph.
 - **Surprise head with EMA calibration**: [src/actor/forward.py](src/actor/forward.py) keeps `surprise_mean` / `surprise_sq_mean` as `register_buffer`s — they persist via `state_dict`, so checkpoints are self-contained. `normalize_actual()` is the canonical way to get a [0, 1] reading.
+- **`ForwardModel.head_losses(s, a, target)` returns a `HeadLosses` NamedTuple** with `(state, surprise, per_sample_error)`. Use it and `HeadLosses.combine(n1, l1, n2, l2)` when computing per-slice dynamics losses — the "surprise target = per-sample MSE of state head" relationship lives on the model, not in the trainer.
 - **`detach_surprise` kwarg in `ForwardModel.forward`**: defaults to True so the head's training loss doesn't tug the trunk — we tried joint training and both losses got worse (capacity competition), so the trunk is kept driven only by `state_head`'s loss. Pass False from the actor rollout when you want the actor to optimize *through* the surprise signal (used by `--actor-surprise-coef > 0`).
 - **Variable-horizon actor rollout**: `--actor-horizon H` rolls actor+forward H steps and compares the final predicted state to `state_{t+H}`. H=1 is byte-equivalent to the original single-step behavior.
 - **`reward_mode="dense"`** for env construction in both [train.py](train.py) and [play.py](play.py). Don't switch back to sparse without good reason — the `episode_return` metric becomes meaningless under sparse.

@@ -66,37 +66,59 @@ of bugs.
 
 ## Actor + ForwardModel
 
-[src/actor/](src/actor/) defines two pure MLPs:
+[src/actor/](src/actor/) defines:
 
 - `Actor`: `state_dim → 256 → ReLU → 256 → ReLU → action_dim`. Raw linear output.
-- `ForwardModel`: `(state, action) → 256 → ReLU → 256 → ReLU → state_dim`.
+- `ForwardModel`: shared `trunk` (`Linear(state+action, 256) → ReLU`) feeds two
+  heads — `state_head` (2-layer MLP → `state_dim`) for next-state prediction,
+  and `surprise_head` (2-layer MLP → softplus scalar) that learns to predict
+  the state head's own per-sample MSE. The trunk is detached before the
+  surprise head, so surprise training never tugs the predictor.
 
 Each has its own optimizer — gradients can't leak across them. The forward model
 is the only path through which the actor's loss reaches reality.
 
 ### Losses
 
-Per iteration, `train.py` computes three:
+Per iteration, `train.py` computes:
 
-- `losses/actor_loss`  = `MSE(actor(obs), expert_action)` — **diagnostic only** at the default weights
-- `losses/dynamics_loss` = `MSE(forward(obs, action), next_obs)` — trains the forward model
-- `losses/total_loss` = `MSE(forward(obs, actor(obs)), next_obs)` — couples actor → forward → state
+- `losses/actor_loss` = `MSE(actor(obs), expert_action)` — diagnostic only at the default weights.
+- `losses/dynamics_loss` = `MSE(state_head(trunk(obs, action)), next_obs)` — trains trunk + state_head.
+- `surprise/head_loss` = `RMSE(surprise_head, detached_per_sample_dynamics_error)` — trains surprise_head.
+- `losses/total_loss` = `MSE(forward^H(obs, actor), state_{t+H})` — H-step rollout, the actor's actual training signal at default weights.
 
-The actor is trained on a weighted mix:
+The actor is trained on a weighted mix, optionally minus an exploration term:
 
 ```
-actor_step_loss = actor_loss_weight * actor_loss + total_loss_weight * total_loss
+actor_step_loss = actor_loss_weight * actor_loss
+                + total_loss_weight * total_loss
+                - actor_surprise_coef * std(normalized_surprise across batch)
 ```
 
 | `--actor-loss-weight` | `--total-loss-weight` | Behavior |
 |---|---|---|
-| `0.0` (default) | `1.0` (default) | **Pure model-based imitation.** Actor never sees the expert's action as a target; it only sees expert `(s, s')` pairs and finds actions that the forward model maps from one to the other. Surprisingly competitive on PickCube. |
+| `0.0` (default) | `1.0` (default) | **Pure model-based imitation.** Actor never sees the expert's action as a target; it only sees expert `(s, s_{t+H})` pairs and finds actions whose rolled-out forward predictions land on the goal state. Surprisingly competitive on PickCube. |
 | `1.0` | `> 0` | Joint: direct BC + model-grounded regularization. |
 | `1.0` | `0.0` | Pure BC. ForwardModel still trains but doesn't influence the actor. |
 
 `total_loss - dynamics_loss` is a useful compounding-error diagnostic: small
 when the actor stays in distribution, grows when it drifts off-policy w.r.t.
 the forward model.
+
+### Surprise
+
+The surprise head is a self-modeling diagnostic + an optional exploration knob.
+At training time it learns the forward model's own per-sample prediction error;
+calling `forward_model.normalize_actual(raw)` sigmoid-standardizes against EMA
+buffers to give a `[0, 1]` reading where 0.5 = "as surprised as the recent
+training-time average." Buffers (`surprise_mean`, `surprise_sq_mean`) persist
+in `state_dict` so checkpoints are self-contained.
+
+Set `--actor-surprise-coef > 0` to reward the actor for producing a *diverse*
+distribution of normalized surprise across the batch (std, not mean — avoids
+the mode collapse where the actor picks one high-surprise trick everywhere).
+Competes with the imitation objective; start in the 0.01–0.05 range. Requires
+`--total-loss-weight > 0`.
 
 ### Online buffer + rollouts
 
@@ -116,7 +138,7 @@ Per dynamics-step, `k = floor(batch_size * online_mix_ratio)` samples are drawn
 from the buffer (clamped by buffer size early in training); the rest comes from
 the BC batch. The two slices are normalized with the same pinned dataset stats so
 the forward model sees a single space. The actor's `total_loss` always uses the
-BC slice (`obs`, `next_obs`) only — no online tensors enter the actor's graph.
+BC slice (`obs`, `goal_obs`) only — no online tensors enter the actor's graph.
 
 The default (`online_mix_ratio=0.95`) means the forward model is shaped almost
 entirely by what the actor *actually does* in the env, while the actor learns
@@ -134,6 +156,8 @@ Logged tensors:
 --total-iters          50000
 --batch-size           1024
 --lr                   3e-4
+--actor-horizon        1          # H-step actor rollout vs state_{t+H} (H=1 = single-step)
+--actor-surprise-coef  0.0        # reward batch-std of normalized rollout surprise (0 = off)
 --online-buffer-size   300000     # FIFO capacity (transitions)
 --online-mix-ratio     0.95       # fraction of dynamics batch from online buffer
 --explore-sigma        0.1        # rollout-only Gaussian noise on actions

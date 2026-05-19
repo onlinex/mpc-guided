@@ -28,7 +28,7 @@ from torch.utils.data import BatchSampler, DataLoader, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from src.actor import Actor, ForwardModel
+from src.actor import Actor, ForwardModel, HeadLosses
 from src.bc import StateBCDataset
 from src.buffer import OnlineBuffer
 
@@ -224,6 +224,12 @@ def _act(
     return action.squeeze(0).cpu().numpy().astype(np.float32)
 
 
+def _unwrap(x) -> bool:
+    """ManiSkill returns single-element batched tensors for done/truncated/success;
+    pull out the scalar and cast to bool."""
+    return bool(np.asarray(x).reshape(-1)[0])
+
+
 def collect_rollouts(
     *,
     env: gym.Env,
@@ -257,7 +263,7 @@ def collect_rollouts(
                 obs, _, terminated, truncated, _ = env.step(action)
                 next_state_raw = np.asarray(obs, dtype=np.float32).reshape(-1)
                 buffer.add(state_raw, action, next_state_raw)
-                if bool(np.asarray(terminated).reshape(-1)[0]) or bool(np.asarray(truncated).reshape(-1)[0]):
+                if _unwrap(terminated) or _unwrap(truncated):
                     break
     actor.train()
 
@@ -283,12 +289,10 @@ def evaluate(
                 action = _act(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
                 obs, reward, terminated, truncated, info = env.step(action)
                 ep_return += float(np.asarray(reward).reshape(-1)[0])
-                sflag = bool(np.asarray(info.get("success", False)).reshape(-1)[0])
+                sflag = _unwrap(info.get("success", False))
                 once = once or sflag
                 end = sflag
-                if bool(np.asarray(terminated).reshape(-1)[0]) or bool(
-                    np.asarray(truncated).reshape(-1)[0]
-                ):
+                if _unwrap(terminated) or _unwrap(truncated):
                     break
             success_once.append(float(once))
             success_at_end.append(float(end))
@@ -390,94 +394,57 @@ def main() -> None:
         ):
             obs, action, next_obs, goal_obs = batch
 
-            # 1. Forward-model update — direct MSE on expert action, optionally
-            #    mixed with on-policy transitions collected during eval.
-            #    Done first so the actor's joint loss can use the freshest forward.
-            #    The surprise head is trained alongside on the detached per-sample
-            #    MSE of the state head; its grads only touch the head itself
-            #    (trunk is detached inside ForwardModel.forward).
+            # 1. Forward-model update on a BC + online mix.
             k = min(int(args.batch_size * args.online_mix_ratio), len(online_buffer))
             n_bc = args.batch_size - k
             forward_optimizer.zero_grad()
+            bc_losses = on_losses = None
             if n_bc > 0:
-                pred_next_bc, pred_surp_bc = forward_model(obs[:n_bc], action[:n_bc])
-                fwd_loss_bc = F.mse_loss(pred_next_bc, next_obs[:n_bc])
-                actual_surp_bc = ((pred_next_bc - next_obs[:n_bc]) ** 2).mean(dim=-1).detach()
-                surp_loss_bc = F.mse_loss(pred_surp_bc, actual_surp_bc)
-            else:
-                fwd_loss_bc = surp_loss_bc = actual_surp_bc = None
+                bc_losses = forward_model.head_losses(
+                    obs[:n_bc], action[:n_bc], next_obs[:n_bc]
+                )
             if k > 0:
                 on_s, on_a, on_ns = online_buffer.sample(k, buffer_rng)
                 on_s_t = (torch.from_numpy(on_s).to(device) - obs_mean_t) / obs_std_t
                 on_ns_t = (torch.from_numpy(on_ns).to(device) - obs_mean_t) / obs_std_t
                 on_a_t = torch.from_numpy(on_a).to(device)
-                pred_next_on, pred_surp_on = forward_model(on_s_t, on_a_t)
-                fwd_loss_on = F.mse_loss(pred_next_on, on_ns_t)
-                actual_surp_on = ((pred_next_on - on_ns_t) ** 2).mean(dim=-1).detach()
-                surp_loss_on = F.mse_loss(pred_surp_on, actual_surp_on)
-            else:
-                fwd_loss_on = surp_loss_on = actual_surp_on = None
-            if fwd_loss_bc is not None and fwd_loss_on is not None:
-                fwd_loss = (n_bc * fwd_loss_bc + k * fwd_loss_on) / args.batch_size
-                surp_loss = (n_bc * surp_loss_bc + k * surp_loss_on) / args.batch_size
-                actual_combined = torch.cat([actual_surp_bc, actual_surp_on])
-            elif fwd_loss_on is None:
-                fwd_loss, surp_loss = fwd_loss_bc, surp_loss_bc
-                actual_combined = actual_surp_bc
-            else:
-                fwd_loss, surp_loss = fwd_loss_on, surp_loss_on
-                actual_combined = actual_surp_on
-            # RMSE on the surprise head: the sqrt scales gradients by
-            # 1/(2*sqrt(MSE)), which amplifies updates when surprise targets
-            # are tiny — useful here since per-sample dynamics errors are small.
-            surp_loss = surp_loss.clamp_min(1e-12).sqrt()
-            (fwd_loss + surp_loss).backward()
+                on_losses = forward_model.head_losses(on_s_t, on_a_t, on_ns_t)
+            losses = HeadLosses.combine(n_bc, bc_losses, k, on_losses)
+            # RMSE not MSE on the surprise head: sqrt amplifies grads when
+            # targets are tiny, which they are (per-sample dynamics errors).
+            surprise_loss = losses.surprise.clamp_min(1e-12).sqrt()
+            (losses.state + surprise_loss).backward()
             forward_optimizer.step()
-            # EMA tracks the same BC+online mixture the dynamics is trained on
-            # so the head's [0, 1] calibration matches what dynamics actually sees.
-            forward_model.update_surprise_stats(actual_combined)
+            forward_model.update_surprise_stats(losses.per_sample_error)
 
-            # 2. Actor update: w_a * actor_loss + w_t * total_loss.
-            #    Either weight may be 0 (validated in parse_args so not both).
-            #    total_loss rolls the actor + forward forward H steps and
-            #    compares to state_{t+H}; H=1 is the single-step baseline.
-            #    forward params are frozen via requires_grad_(False) for the
-            #    rollout so autograd doesn't build grad buffers for them — the
-            #    actor_optimizer wouldn't update them anyway, this just saves
-            #    memory (matters as H or the forward model grows).
+            # 2. Actor update. total_loss rolls (actor + forward) H steps and
+            #    compares to state_{t+H}; forward params are frozen for the
+            #    rollout to avoid building grad buffers we wouldn't use anyway.
             optimizer.zero_grad()
             pred = actor(obs)
             actor_loss = F.mse_loss(pred, action)
             forward_model.requires_grad_(False)
-            # Keep full (B,) per step so we can log distribution (histogram +
-            # percentiles), not just the batch mean.
-            rollout_surprise: list[torch.Tensor] = []
-            # When coef>0, also keep grad-tracking surprise (forward called with
-            # detach_surprise=False) so the actor can optimize through it.
-            rollout_surprise_grad: list[torch.Tensor] = []
+            # detach_surprise=False keeps the surprise -> trunk -> action path
+            # alive so the actor pull term's gradient can reach actor params.
+            collect_grad_surprise = w_t > 0 and args.actor_surprise_coef > 0
+            rollout_surprise: list[torch.Tensor] = []          # detached, for logging
+            rollout_surprise_grad: list[torch.Tensor] = []     # grad-tracking, for loss
             actor_pull_term = None
-            if w_t > 0:
+            with torch.set_grad_enabled(w_t > 0):
                 s = obs
                 for _ in range(H):
                     s, ps = forward_model(
-                        s, actor(s), detach_surprise=(args.actor_surprise_coef == 0)
+                        s, actor(s), detach_surprise=not collect_grad_surprise
                     )
                     rollout_surprise.append(ps.detach())
-                    if args.actor_surprise_coef > 0:
+                    if collect_grad_surprise:
                         rollout_surprise_grad.append(ps)
                 total_loss = F.mse_loss(s, goal_obs)
-            else:
-                with torch.no_grad():
-                    s = obs
-                    for _ in range(H):
-                        s, ps = forward_model(s, actor(s))
-                        rollout_surprise.append(ps)
-                    total_loss = F.mse_loss(s, goal_obs)
             joint_loss = w_a * actor_loss + w_t * total_loss
             if rollout_surprise_grad:
-                # Maximize across-batch std of normalized surprise → subtract
-                # from joint_loss. Rewards diversity (different states drive
-                # different surprise levels), not magnitude.
+                # Std (not mean) of normalized surprise: rewards diverse
+                # rollouts, not just high-surprise ones — avoids the mode
+                # collapse where the actor finds one high-surprise trick.
                 stacked = forward_model.normalize_actual(
                     torch.stack(rollout_surprise_grad)
                 )  # (H, B)
@@ -489,33 +456,30 @@ def main() -> None:
 
             if iteration % args.log_freq == 0:
                 writer.add_scalar("losses/actor_loss", float(actor_loss.detach().cpu()), iteration)
-                writer.add_scalar("losses/dynamics_loss", float(fwd_loss.detach().cpu()), iteration)
-                if fwd_loss_bc is not None:
-                    writer.add_scalar("losses/dynamics_loss_bc", float(fwd_loss_bc.detach().cpu()), iteration)
-                if fwd_loss_on is not None:
-                    writer.add_scalar("losses/dynamics_loss_online", float(fwd_loss_on.detach().cpu()), iteration)
+                writer.add_scalar("losses/dynamics_loss", float(losses.state.detach().cpu()), iteration)
+                if bc_losses is not None:
+                    writer.add_scalar("losses/dynamics_loss_bc", float(bc_losses.state.detach().cpu()), iteration)
+                if on_losses is not None:
+                    writer.add_scalar("losses/dynamics_loss_online", float(on_losses.state.detach().cpu()), iteration)
                 writer.add_scalar("losses/total_loss", float(total_loss.detach().cpu()), iteration)
                 writer.add_scalar("online/buffer_size", len(online_buffer), iteration)
                 writer.add_scalar("charts/lr", optimizer.param_groups[0]["lr"], iteration)
-                writer.add_scalar("surprise/head_loss", float(surp_loss.detach().cpu()), iteration)
+                writer.add_scalar("surprise/head_loss", float(surprise_loss.detach().cpu()), iteration)
                 if actor_pull_term is not None:
                     writer.add_scalar(
                         "surprise/actor_pull",
                         float(actor_pull_term.detach().cpu()),
                         iteration,
                     )
-                if rollout_surprise:
-                    # (H, B) raw -> (H, B) normalized in [0, 1]. Log batch
-                    # mean and the full distribution per step.
-                    norm = forward_model.normalize_actual(
-                        torch.stack(rollout_surprise)
-                    ).cpu()
-                    for step_idx in range(norm.shape[0]):
-                        k = step_idx + 1
-                        step_vals = norm[step_idx]
-                        writer.add_scalar(f"surprise/rollout_step/{k}", float(step_vals.mean()), iteration)
-                        writer.add_histogram(f"surprise/rollout_dist/{k}", step_vals, iteration)
-                    writer.add_scalar("surprise/rollout_mean", float(norm.mean()), iteration)
+                # (H, B) raw -> (H, B) normalized in [0, 1].
+                norm = forward_model.normalize_actual(
+                    torch.stack(rollout_surprise)
+                ).cpu()
+                for step_idx in range(norm.shape[0]):
+                    step_vals = norm[step_idx]
+                    writer.add_scalar(f"surprise/rollout_step/{step_idx + 1}", float(step_vals.mean()), iteration)
+                    writer.add_histogram(f"surprise/rollout_dist/{step_idx + 1}", step_vals, iteration)
+                writer.add_scalar("surprise/rollout_mean", float(norm.mean()), iteration)
 
             if iteration % args.rollout_freq == 0:
                 collect_rollouts(

@@ -19,9 +19,49 @@ calibrated, no external state.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class HeadLosses(NamedTuple):
+    """Per-head training losses produced by ``ForwardModel.head_losses``.
+
+    - ``state``: scalar MSE that trains trunk + state_head.
+    - ``surprise``: scalar MSE that trains surprise_head against the detached
+      per-sample error.
+    - ``per_sample_error``: (B,) detached per-sample MSE of the state head.
+      Doubles as the surprise head's training target and the EMA's input.
+    """
+
+    state: torch.Tensor
+    surprise: torch.Tensor
+    per_sample_error: torch.Tensor
+
+    @classmethod
+    def combine(
+        cls,
+        n1: int,
+        l1: "HeadLosses | None",
+        n2: int,
+        l2: "HeadLosses | None",
+    ) -> "HeadLosses":
+        """Merge two slices: batch-weighted average of scalars, concat of
+        per-sample errors. Either slice may be ``None`` (empty); at least one
+        must be non-None.
+        """
+        if l1 is None:
+            return l2
+        if l2 is None:
+            return l1
+        total = n1 + n2
+        return cls(
+            state=(n1 * l1.state + n2 * l2.state) / total,
+            surprise=(n1 * l1.surprise + n2 * l2.surprise) / total,
+            per_sample_error=torch.cat([l1.per_sample_error, l2.per_sample_error]),
+        )
 
 
 class ForwardModel(nn.Module):
@@ -91,6 +131,26 @@ class ForwardModel(nn.Module):
         h_for_surp = h.detach() if detach_surprise else h
         surprise = F.softplus(self.surprise_head(h_for_surp)).squeeze(-1)
         return next_state, surprise
+
+    def head_losses(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        target_next: torch.Tensor,
+    ) -> HeadLosses:
+        """Run forward once and produce the training losses for both heads.
+
+        The surprise head's target is the per-sample MSE of the state head —
+        an architectural property of this model, so the relationship lives
+        here rather than in the trainer.
+        """
+        pred_next, pred_surp = self(state, action)
+        per_sample_error = ((pred_next - target_next) ** 2).mean(dim=-1).detach()
+        return HeadLosses(
+            state=F.mse_loss(pred_next, target_next),
+            surprise=F.mse_loss(pred_surp, per_sample_error),
+            per_sample_error=per_sample_error,
+        )
 
     @torch.no_grad()
     def update_surprise_stats(self, actual: torch.Tensor) -> None:
