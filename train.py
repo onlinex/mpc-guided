@@ -322,15 +322,15 @@ def evaluate(
 ) -> dict[str, float]:
     success_once, success_at_end, returns, lengths = [], [], [], []
     actor.eval()
-    H = actor.chunk_size
+    N = actor.chunk_size
     with torch.no_grad():
         for i in range(num_episodes):
             obs, _ = env.reset(seed=seed_base + i)
             ep_return, once, end, steps = 0.0, False, False, 0
-            chunk, chunk_idx = None, H
+            chunk, chunk_idx = None, N
             while True:
                 steps += 1
-                if chunk_idx >= H:
+                if chunk_idx >= N:
                     chunk = _act_chunk(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
                     chunk_idx = 0
                 action = chunk[chunk_idx]
