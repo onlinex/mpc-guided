@@ -10,17 +10,27 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from src.actor.temporal import TemporalConv1d
 
 
 class Actor(nn.Module):
-    """state_dim -> 256 -> ReLU -> 256 -> ReLU -> latent_dim -> chunk_size * action_dim.
+    """state_dim -> encoder -> latent (the plan bottleneck) -> chunk decoder
+    -> (chunk_size, action_dim).
 
-    A linear bottleneck (``latent_dim``, no activation) sits between the
-    encoder and the per-chunk decoder. The actor has to compress its plan
-    into ``latent_dim`` numbers before expanding to ``chunk_size`` actions,
-    which acts as a regularizer against emitting ``chunk_size * action_dim``
-    independent scalars. Output reshaped to ``(B, chunk_size, action_dim)``;
-    callers index ``out[:, 0]`` for the next action.
+    The encoder is a 2-layer 256-wide MLP that compresses state into a
+    ``latent_dim`` plan (linear bottleneck, no activation). The decoder
+    expands that plan into a length-``chunk_size`` action sequence:
+
+      latent (B, latent_dim)
+        -> broadcast + positional embedding -> (B, N, latent_dim)
+        -> TemporalConv1d(k) + ReLU                 (smoothness prior)
+        -> per-step shared Linear(latent_dim, action_dim)
+
+    The temporal conv shares weights across positions, so the decoder pays
+    a representational cost to make neighbouring actions wildly different
+    — a real smoothness prior, not just a loss penalty.
     """
 
     def __init__(
@@ -29,6 +39,7 @@ class Actor(nn.Module):
         action_dim: int,
         chunk_size: int = 1,
         latent_dim: int = 32,
+        conv_kernel: int = 3,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
@@ -41,9 +52,25 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(256, latent_dim),
         )
-        self.decoder = nn.Linear(latent_dim, chunk_size * action_dim)
+        # Same plan, different time slot: positional embedding is the only
+        # source of position-specific structure before the conv mixes
+        # neighbours. Init small so all positions start ~at the latent and
+        # training spreads them apart as needed.
+        self.pos_embed = nn.Parameter(torch.zeros(chunk_size, latent_dim))
+        nn.init.normal_(self.pos_embed, std=0.02)
+        self.temporal = TemporalConv1d(latent_dim, latent_dim, conv_kernel)
+        self.head = nn.Linear(latent_dim, action_dim)
+
+    def encode(self, state: torch.Tensor) -> torch.Tensor:
+        """state -> latent. Split out so callers can perturb the latent
+        (e.g., exploration noise in the bottleneck) before decoding."""
+        return self.encoder(state)
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """latent (B, latent_dim) -> chunk (B, chunk_size, action_dim)."""
+        seq = latent.unsqueeze(1) + self.pos_embed  # (B, N, latent_dim)
+        seq = F.relu(self.temporal(seq))
+        return self.head(seq)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        latent = self.encoder(state)
-        out = self.decoder(latent)
-        return out.view(*state.shape[:-1], self.chunk_size, self.action_dim)
+        return self.decode(self.encode(state))

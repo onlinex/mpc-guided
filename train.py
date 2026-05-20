@@ -163,9 +163,11 @@ def parse_args() -> Args:
         "--explore-sigma",
         type=float,
         default=d.explore_sigma,
-        help="Std-dev of Gaussian noise added to greedy actions during ROLLOUTS only "
-        "(0 = deterministic). Eval is always deterministic. Noisy action is clipped "
-        "to [-1, 1] and stored verbatim in the buffer.",
+        help="Std-dev of Gaussian noise injected into the actor's bottleneck "
+        "LATENT during rollouts only (0 = deterministic). Perturbs the plan, "
+        "not individual actions — the decoder still expands it into a "
+        "coherent chunk. Eval is always deterministic. Decoded chunk is "
+        "clipped to [-1, 1] before execution and stored verbatim in the buffer.",
     )
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--sim-backend", default=d.sim_backend)
@@ -228,15 +230,24 @@ def _act_chunk(
     device: torch.device,
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
+    latent_sigma: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """Greedy action *chunk* from normalized state. Shape ``(chunk_size, action_dim)``.
 
-    Env rollouts execute the chunk open-loop and re-query on exhaustion — so
-    a chunked actor commits to a short action sequence per query, matching
-    the H-step open-loop rollout used during training.
+    With ``latent_sigma > 0``, Gaussian noise is injected into the actor's
+    bottleneck latent (post-encoder, pre-decoder), so exploration perturbs
+    the *plan* rather than each action independently — the decoder still
+    expands it into a coherent chunk.
     """
     state = (np.asarray(obs, dtype=np.float32).reshape(-1) - obs_mean) / obs_std
-    chunk = actor(torch.from_numpy(state).to(device).unsqueeze(0))
+    state_t = torch.from_numpy(state).to(device).unsqueeze(0)
+    latent = actor.encode(state_t)
+    if latent_sigma > 0:
+        assert rng is not None, "rng required when latent_sigma > 0"
+        noise = rng.normal(0.0, latent_sigma, size=latent.shape).astype(np.float32)
+        latent = latent + torch.from_numpy(noise).to(device)
+    chunk = actor.decode(latent)
     return chunk.squeeze(0).cpu().numpy().astype(np.float32)
 
 
@@ -276,12 +287,14 @@ def collect_rollouts(
                 # the episode terminates mid-chunk, drop the partial — the
                 # dynamics model only trains on completed N-step transitions.
                 chunk_start = np.asarray(obs, dtype=np.float32).reshape(-1)
-                chunk = _act_chunk(actor, obs, device=device, obs_mean=obs_mean, obs_std=obs_std)
+                chunk = _act_chunk(
+                    actor, obs,
+                    device=device, obs_mean=obs_mean, obs_std=obs_std,
+                    latent_sigma=sigma, rng=rng,
+                )
                 if sigma > 0:
-                    chunk = np.clip(
-                        chunk + rng.normal(0.0, sigma, size=chunk.shape).astype(np.float32),
-                        -1.0, 1.0,
-                    )
+                    # Latent noise can push decoded actions outside [-1, 1].
+                    chunk = np.clip(chunk, -1.0, 1.0)
                 executed_chunk = chunk.copy()
                 complete = True
                 for t in range(N):
