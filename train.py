@@ -411,7 +411,10 @@ def main() -> None:
         f"horizon={ds.horizon} chunk_size={ds.chunk_size})"
     )
 
-    sampler = RandomSampler(ds)
+    # Dedicated generator: decouple batch order from global torch RNG.
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(args.seed)
+    sampler = RandomSampler(ds, generator=sampler_generator)
     batch_sampler = BatchSampler(sampler, args.batch_size, drop_last=True)
     iter_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
     dataloader = DataLoader(ds, batch_sampler=iter_sampler, num_workers=0)
